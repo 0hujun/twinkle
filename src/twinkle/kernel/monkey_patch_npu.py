@@ -51,9 +51,10 @@ def _is_ep_enabled(model=None) -> bool:
     When EP is active, each rank holds only a subset of expert weights,
     making ``npu_grouped_matmul`` efficient (small contiguous weights).
     """
-    if model is None or model.device_mesh is None:
+    device_mesh = getattr(model, 'device_mesh', None)
+    if device_mesh is None:
         return False
-    return (getattr(model.device_mesh, 'ep_size', None) or 0) > 1
+    return (getattr(device_mesh, 'ep_size', None) or 0) > 1
 
 
 # =============================================================================
