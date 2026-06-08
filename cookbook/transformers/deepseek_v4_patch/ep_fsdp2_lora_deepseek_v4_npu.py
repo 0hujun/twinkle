@@ -19,10 +19,12 @@ OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './output')
 MAX_LENGTH = int(os.environ.get('MAX_LENGTH', '4096'))
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '32'))
 GRAD_ACCUM_STEPS = int(os.environ.get('GRAD_ACCUM_STEPS', '2'))
+LOG_INTERVAL = GRAD_ACCUM_STEPS
 LR = float(os.environ.get('LR', '1e-5'))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', '0'))
 SAVE_STEPS = int(os.environ.get('SAVE_STEPS', '50'))
 USE_LORA = os.environ.get('USE_LORA', '1') == '1'
+MAX_GRAD_NORM = float(os.environ.get('MAX_GRAD_NORM', '1.0'))
 IGNORE_MISMATCHED_SIZES = os.environ.get('IGNORE_MISMATCHED_SIZES', '1') == '1'
 GRADIENT_CHECKPOINTING = os.environ.get('GRADIENT_CHECKPOINTING', '1') == '1'
 RESHARD_AFTER_FORWARD = os.environ.get('RESHARD_AFTER_FORWARD', '1') == '1'
@@ -31,7 +33,7 @@ LORA_TARGET_MODULES = os.environ.get(
     'wq_a,wq_b,wkv,wgate,gate_proj,up_proj,down_proj',
 )
 USE_EP = os.environ.get('USE_EP', '0') == '1'
-
+ADAPTER_NAME = os.environ.get('ADAPTER_NAME', 'default')
 EP_SIZE = BATCH_SIZE if USE_EP else 1
 device_mesh = DeviceMesh.from_sizes(
     fsdp_size=BATCH_SIZE,
@@ -85,15 +87,15 @@ def train():
     if not GRADIENT_CHECKPOINTING:
         model.model.gradient_checkpointing_disable()
 
-    model.set_template(TEMPLATE_ID, model_id=MODEL_ID, adapter_name='default')
-    model.set_optimizer('AdamW', lr=LR, foreach=False, adapter_name='default')
+    model.set_template(TEMPLATE_ID, model_id=MODEL_ID, adapter_name=ADAPTER_NAME)
+    model.set_optimizer('AdamW', lr=LR, foreach=False, adapter_name=ADAPTER_NAME)
     model.set_lr_scheduler(
         scheduler_cls='CosineWarmupScheduler',
         num_warmup_steps=1,
         num_training_steps=len(dataloader),
-        adapter_name='default',
+        adapter_name=ADAPTER_NAME,
     )
-
+    optimizer_group = model.optimizer_group[ADAPTER_NAME]
     for batch in dataloader:
         if callable(batch):
             batch = batch()
