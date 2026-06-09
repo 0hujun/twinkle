@@ -16,12 +16,12 @@ def _npu_sparse_attn_shared_kv(query, ori_kv, cmp_kv, cmp_sparse_indices, sinks,
     batch_size, max_seq_len_q, num_heads_q, head_dim = query.size()
     num_heads_kv = 1
     max_seq_len_kv = ori_kv.size(1)
-    topk = 0 if cmp_ratio != 4 else cmp_sparse_indices.size(-1)
+    topk = 0 if (cmp_ratio != 4 or cmp_sparse_indices is None) else cmp_sparse_indices.size(-1)
     layout_q = layout_kv = 'BSND'
     query = query.contiguous()
     ori_kv = ori_kv.unsqueeze(2).contiguous()
     cmp_kv = cmp_kv if cmp_kv is None else cmp_kv.unsqueeze(2).contiguous()
-    cmp_sparse_indices = None if cmp_ratio != 4 else cmp_sparse_indices.unsqueeze(2).contiguous()
+    cmp_sparse_indices = None if (cmp_ratio != 4 or cmp_sparse_indices is None) else cmp_sparse_indices.unsqueeze(2).contiguous()
 
     from mindspeed.ops.npu_sparse_attn_shared_kv import SparseAttnSharedKV
 
