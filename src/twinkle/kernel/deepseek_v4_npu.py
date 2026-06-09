@@ -127,7 +127,8 @@ def _patched_attention_forward(
             )
             _sas_logged = True
         attn_weights = None
-    except ImportError:
+    except Exception as e:
+        logger.warning('[NPU] [DSV4-SAS] Failed to run sparse attention, falling back to standard attention. Error: %s', e)
         use_sas = False
 
     if not use_sas:
