@@ -260,8 +260,8 @@ def _patched_indexer_forward(
                 )
                 _li_logged = True
             return top_k_indices
-        except (ImportError, NameError):
-            pass
+        except Exception as e:
+            logger.warning('[NPU] [DSV4-LI] Failed to run lightning indexer, falling back to torch indexer. Error: %s', e)
 
     return torch_indexer_top_k_indices()
 
