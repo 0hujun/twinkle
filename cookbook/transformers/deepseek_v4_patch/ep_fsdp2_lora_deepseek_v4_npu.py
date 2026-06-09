@@ -49,9 +49,16 @@ def create_dataset(data_slice=None):
     dataset = Dataset(dataset_meta=DatasetMeta(DATASET_ID))
     dataset.set_template(TEMPLATE_ID, model_id=MODEL_ID)
     dataset.map(SelfCognitionProcessor('twinkle', 'ModelScope'))
-    dataset.encode(batched=True)
-    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, device_mesh=device_mesh)
     return dataset
+
+def save_checkpoint(model: TransformersModel, checkpoint_name: str, dataloader: DataLoader):
+    return model.save(
+        name=checkpoint_name,
+        output_dir=OUTPUT_DIR,
+        adapter_name=ADAPTER_NAME,
+        save_optimizer=True,
+        consumed_train_samples=dataloader.get_state()['consumed_train_samples'],
+    )
 
 def train():
     dataset = create_dataset()
