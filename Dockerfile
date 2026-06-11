@@ -1,3 +1,8 @@
+# ---------- Stage 0: grab pre-built binaries ----------
+FROM redis:7 AS redis
+FROM grafana/otel-lgtm:latest AS lgtm
+
+# ---------- Stage 1: GPU training / serving image ----------
 FROM modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:ubuntu22.04-cuda12.8.1-py311-torch2.9.1-1.35.0
 
 # Install miniconda with Python 3.12
@@ -47,5 +52,14 @@ RUN echo "Available release branches:" && git branch -r -l 'origin/release/*' --
     echo "Checking out: $LATEST_RELEASE" && \
     git checkout --track "$LATEST_RELEASE"
 
-# Install twinkle itself
-RUN pip install -e . --no-build-isolation
+# Install twinkle itself (with server extras: redis + otel + telemetry)
+RUN pip install -e ".[server]" --no-build-isolation
+
+# ---------- Redis server ----------
+COPY --from=redis /usr/local/bin/redis-server /usr/local/bin/redis-server
+COPY --from=redis /usr/local/bin/redis-cli /usr/local/bin/redis-cli
+
+# ---------- Observability: Grafana LGTM stack ----------
+COPY --from=lgtm /otel-lgtm /otel-lgtm
+COPY cookbook/observability/grafana/dashboards/twinkle-overview.json \
+     /otel-lgtm/grafana/conf/provisioning/dashboards/twinkle-overview.json
