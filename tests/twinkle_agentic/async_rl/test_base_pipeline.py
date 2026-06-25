@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-from twinkle_agentic.async_rl import BaseRLPipeline, BaseRLPipelineConfig, PartitionStatus
+from twinkle_agentic.async_rl import BaseRLPipeline, BaseRLPipelineConfig, PartitionStatus, TransferQueueDataPlane
+
+from .fakes import FakeTransferQueueClient
 
 
 def make_sample(i=0):
@@ -62,6 +64,7 @@ def test_base_pipeline_runs_one_multilora_grpo_partition():
         model=model,
         rollout=rollout,
         reward_registry={'constant': lambda trajectories, **_: [1.0 for _ in trajectories]},
+        data_plane=TransferQueueDataPlane(tq_client=FakeTransferQueueClient()),
         receive_weights_fn=lambda context: received.append(context),
     )
 
@@ -94,6 +97,7 @@ def test_base_pipeline_uses_latest_adapter_revision_for_next_rollout():
         model=model,
         rollout=rollout,
         reward_registry={'constant': lambda trajectories, **_: [1.0 for _ in trajectories]},
+        data_plane=TransferQueueDataPlane(tq_client=FakeTransferQueueClient()),
     )
 
     pipeline.run([make_sample(0)], max_steps=1)

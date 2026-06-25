@@ -3,82 +3,67 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 from .types import PartitionMetadata, PartitionStatus, SampleRecord, TrainingContext
 
 
-class InMemoryTransferQueueBackend:
-    """Small backend with TransferQueue-like semantics for tests and local MVP runs."""
+@dataclass
+class TransferQueueRuntimeConfig:
+    """TransferQueue initialization and lightweight capacity guard config."""
 
-    def __init__(self):
-        self.partitions: Dict[str, Dict[str, SampleRecord]] = defaultdict(dict)
-        self.partition_meta: Dict[str, PartitionMetadata] = {}
-        self._lock = threading.RLock()
-
-    def put_samples(
-        self,
-        partition: PartitionMetadata,
-        samples: Iterable[SampleRecord],
-        *,
-        key_prefix: str = 'sample',
-    ) -> list[str]:
-        with self._lock:
-            self.partition_meta[partition.partition_id] = partition
-            keys = []
-            bucket = self.partitions[partition.partition_id]
-            for sample in samples:
-                key = sample.get('sample_id') or f'{key_prefix}_{len(bucket)}'
-                bucket[key] = dict(sample)
-                keys.append(key)
-            partition.num_rows = len(bucket)
-            partition.touch()
-            return keys
-
-    def get_samples(self, partition_id: str, keys: Optional[list[str]] = None) -> list[SampleRecord]:
-        with self._lock:
-            bucket = self.partitions.get(partition_id, {})
-            selected = keys if keys is not None else list(bucket)
-            return [dict(bucket[k]) for k in selected if k in bucket]
-
-    def update_samples(self, partition_id: str, updates: Dict[str, Dict[str, Any]]) -> None:
-        with self._lock:
-            bucket = self.partitions[partition_id]
-            for key, fields in updates.items():
-                bucket[key].update(fields)
-            if partition_id in self.partition_meta:
-                self.partition_meta[partition_id].touch()
-
-    def list_partition_ids(self) -> list[str]:
-        with self._lock:
-            return list(self.partition_meta)
-
-    def clear_partition(self, partition_id: str) -> None:
-        with self._lock:
-            self.partitions.pop(partition_id, None)
-            meta = self.partition_meta.get(partition_id)
-            if meta is not None:
-                meta.status = PartitionStatus.CLEARED
-                meta.touch()
+    total_storage_size: Optional[int] = None
+    max_rows: Optional[int] = None
+    max_rows_per_context: Optional[int] = None
+    num_data_storage_units: int = 4
+    storage_backend: str = 'SimpleStorage'
+    controller: Dict[str, Any] = field(default_factory=dict)
+    backend: Dict[str, Any] = field(default_factory=dict)
+    init: bool = True
 
 
 class TransferQueueDataPlane:
-    """Context-safe data-plane boundary around TransferQueue.
+    """The only data-plane boundary for async RL TransferQueue access."""
 
-    The MVP implementation stores metadata locally and can use an in-memory
-    backend. A production deployment can pass a backend object with compatible
-    methods or extend this class to call `transfer_queue` directly.
-    """
-
-    def __init__(self, backend: Optional[InMemoryTransferQueueBackend] = None):
-        self.backend = backend or InMemoryTransferQueueBackend()
-        self._meta: Dict[str, PartitionMetadata] = self.backend.partition_meta
+    def __init__(self, tq_client: Optional[Any] = None, tq_config: Optional[TransferQueueRuntimeConfig] = None):
+        self.tq_config = tq_config or TransferQueueRuntimeConfig()
+        self.tq = tq_client or self._init_transfer_queue(self.tq_config)
+        self._meta: Dict[str, PartitionMetadata] = {}
         self._next_train_id: Dict[str, int] = defaultdict(int)
         self._lock = threading.RLock()
 
+    def _init_transfer_queue(self, config: TransferQueueRuntimeConfig):
+        try:
+            import transfer_queue as tq
+        except ImportError as exc:
+            raise RuntimeError(
+                'transfer_queue is required for TransferQueueDataPlane. '
+                'Pass an explicit tq_client only in unit tests/local mocks.'
+            ) from exc
+        if config.init:
+            tq.init(self._build_tq_config(config))
+        return tq
+
+    @staticmethod
+    def _build_tq_config(config: TransferQueueRuntimeConfig):
+        try:
+            from omegaconf import OmegaConf
+        except ImportError as exc:
+            raise RuntimeError('omegaconf is required to initialize transfer_queue config') from exc
+        backend_config = dict(config.backend)
+        simple_storage = dict(backend_config.get('SimpleStorage') or {})
+        simple_storage.setdefault('num_data_storage_units', config.num_data_storage_units)
+        if config.total_storage_size is not None:
+            simple_storage.setdefault('total_storage_size', config.total_storage_size)
+        backend_config.setdefault('storage_backend', config.storage_backend)
+        backend_config['SimpleStorage'] = simple_storage
+        return OmegaConf.create(
+            {'controller': config.controller, 'backend': backend_config},
+            flags={'allow_objects': True},
+        )
+
     def init_namespace(self, context: TrainingContext) -> None:
-        # Namespace is implicit in the partition id. This method is kept as the
-        # single initialization hook for future real TransferQueue setup.
         context.metadata()
 
     def next_partition_id(self, context: TrainingContext) -> str:
@@ -120,21 +105,26 @@ class TransferQueueDataPlane:
                 meta = self.create_partition(context, target_groups=ready_groups, partition_id=partition_id)
             if meta.context.key != context.key:
                 raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
-            samples = []
+            keys = []
             for idx, trajectory in enumerate(trajectories):
                 sample = dict(trajectory)
                 sample_meta = dict(sample.get('metadata') or {})
                 sample_meta.update(context.metadata())
                 sample_meta.setdefault('partition_id', partition_id)
                 context.validate_metadata(sample_meta)
-                sample['metadata'] = sample_meta
-                sample.setdefault('sample_id', f'{partition_id}/sample_{meta.num_rows + idx}')
-                samples.append(sample)
-            self.backend.put_samples(meta, samples)
+                key = sample.get('sample_id') or f'{partition_id}/sample_{meta.num_rows + idx}'
+                fields = {k: v for k, v in sample.items() if k not in {'metadata', 'sample_id'}}
+                tag = dict(sample_meta)
+                tag.update(meta.tag())
+                self.tq.kv_put(key=key, partition_id=partition_id, fields=fields, tag=tag)
+                keys.append(key)
+            meta.num_rows += len(keys)
             meta.ready_groups += ready_groups
             if seal or (meta.target_groups and meta.ready_groups >= meta.target_groups):
                 meta.status = PartitionStatus.ROLLOUT_DONE
             meta.touch()
+            self._meta[partition_id] = meta
+            self._sync_partition_status(meta)
             return meta
 
     def list_partitions(
@@ -143,6 +133,7 @@ class TransferQueueDataPlane:
         *,
         statuses: Optional[Iterable[PartitionStatus]] = None,
     ) -> list[PartitionMetadata]:
+        self._load_partition_meta()
         status_set = set(statuses) if statuses is not None else None
         with self._lock:
             partitions = list(self._meta.values())
@@ -156,17 +147,17 @@ class TransferQueueDataPlane:
         return self.list_partitions(context)
 
     def check_capacity(self, context: TrainingContext) -> bool:
-        # Real TQ capacity is enforced by the storage backend; the MVP data
-        # plane keeps this hook explicit for AsyncRollouter gating.
+        live_partitions = [p for p in self.list_partitions() if p.status != PartitionStatus.CLEARED]
+        total_rows = sum(p.num_rows for p in live_partitions)
+        context_rows = sum(p.num_rows for p in live_partitions if p.context.key == context.key)
+        if self.tq_config.max_rows is not None and total_rows >= self.tq_config.max_rows:
+            return False
+        if self.tq_config.max_rows_per_context is not None and context_rows >= self.tq_config.max_rows_per_context:
+            return False
         return True
 
     def claim_reward_batch(self, context: TrainingContext, batch_size: int) -> tuple[PartitionMetadata, list[SampleRecord]]:
-        partitions = self.list_partitions(context, statuses=[PartitionStatus.ROLLOUT_DONE])
-        if not partitions:
-            raise LookupError(f'no rollout-ready partition for {context.key}')
-        meta = partitions[0]
-        samples = self.backend.get_samples(meta.partition_id)[:batch_size]
-        return meta, samples
+        return self._claim_samples(context, batch_size, [PartitionStatus.ROLLOUT_DONE], 'reward')
 
     def append_rewards(
         self,
@@ -176,26 +167,22 @@ class TransferQueueDataPlane:
         *,
         field_name: str = 'rewards',
     ) -> PartitionMetadata:
-        samples = self.backend.get_samples(partition_id)
+        samples = self._get_samples(partition_id)
         if len(rewards) != len(samples):
             raise ValueError(f'reward count {len(rewards)} does not match sample count {len(samples)}')
         updates = {}
         for sample, reward in zip(samples, rewards):
             context.validate_metadata(sample.get('metadata') or {})
             updates[sample['sample_id']] = {field_name: reward}
-        self.backend.update_samples(partition_id, updates)
+        self._update_samples(partition_id, updates)
         meta = self._meta[partition_id]
         meta.status = PartitionStatus.REWARD_DONE
         meta.touch()
+        self._sync_partition_status(meta)
         return meta
 
     def claim_advantage_batch(self, context: TrainingContext, batch_size: int) -> tuple[PartitionMetadata, list[SampleRecord]]:
-        partitions = self.list_partitions(context, statuses=[PartitionStatus.REWARD_DONE])
-        if not partitions:
-            raise LookupError(f'no reward-ready partition for {context.key}')
-        meta = partitions[0]
-        samples = self.backend.get_samples(meta.partition_id)[:batch_size]
-        return meta, samples
+        return self._claim_samples(context, batch_size, [PartitionStatus.REWARD_DONE], 'advantage')
 
     def append_advantages(
         self,
@@ -204,7 +191,7 @@ class TransferQueueDataPlane:
         advantages: list[float],
         returns: Optional[list[float]] = None,
     ) -> PartitionMetadata:
-        samples = self.backend.get_samples(partition_id)
+        samples = self._get_samples(partition_id)
         if len(advantages) != len(samples):
             raise ValueError(f'advantage count {len(advantages)} does not match sample count {len(samples)}')
         if returns is None:
@@ -213,39 +200,155 @@ class TransferQueueDataPlane:
         for sample, advantage, ret in zip(samples, advantages, returns):
             context.validate_metadata(sample.get('metadata') or {})
             updates[sample['sample_id']] = {'advantages': advantage, 'returns': ret}
-        self.backend.update_samples(partition_id, updates)
+        self._update_samples(partition_id, updates)
         meta = self._meta[partition_id]
         meta.status = PartitionStatus.TRAIN_READY
         meta.touch()
+        self._sync_partition_status(meta)
         return meta
 
     def list_train_ready_partitions(self) -> list[PartitionMetadata]:
         return self.list_partitions(statuses=[PartitionStatus.TRAIN_READY])
 
     def mark_training(self, context: TrainingContext, partition_id: str) -> PartitionMetadata:
-        meta = self._meta[partition_id]
-        if meta.context.key != context.key:
-            raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
-        meta.status = PartitionStatus.TRAINING
-        meta.touch()
-        return meta
+        return self._mark_status(context, partition_id, PartitionStatus.TRAINING)
 
     def mark_trained(self, context: TrainingContext, partition_id: str) -> PartitionMetadata:
-        meta = self._meta[partition_id]
-        if meta.context.key != context.key:
-            raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
-        meta.status = PartitionStatus.TRAIN_DONE
-        meta.touch()
-        return meta
+        return self._mark_status(context, partition_id, PartitionStatus.TRAIN_DONE)
 
     def build_streaming_dataloader(self, context: TrainingContext, partition_id: str):
         meta = self._meta[partition_id]
         if meta.context.key != context.key:
             raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
-        return self.backend.get_samples(partition_id)
+        return self._get_samples(partition_id)
 
     def clear_partition(self, context: TrainingContext, partition_id: str) -> None:
         meta = self._meta.get(partition_id)
         if meta is not None and meta.context.key != context.key:
             raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
-        self.backend.clear_partition(partition_id)
+        keys = list(self.tq.kv_list(partition_id=partition_id).get(partition_id, {}))
+        if keys:
+            self.tq.kv_clear(keys=keys, partition_id=partition_id)
+        if meta is not None:
+            meta.status = PartitionStatus.CLEARED
+            meta.touch()
+
+    def _claim_samples(
+        self,
+        context: TrainingContext,
+        batch_size: int,
+        statuses: Iterable[PartitionStatus],
+        task_name: str,
+    ) -> tuple[PartitionMetadata, list[SampleRecord]]:
+        partitions = self.list_partitions(context, statuses=statuses)
+        if not partitions:
+            raise LookupError(f'no {task_name}-ready partition for {context.key}')
+        meta = partitions[0]
+        return meta, self._get_samples(meta.partition_id)[:batch_size]
+
+    def _mark_status(self, context: TrainingContext, partition_id: str, status: PartitionStatus) -> PartitionMetadata:
+        meta = self._meta[partition_id]
+        if meta.context.key != context.key:
+            raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
+        meta.status = status
+        meta.touch()
+        self._sync_partition_status(meta)
+        return meta
+
+    def _get_samples(self, partition_id: str) -> list[SampleRecord]:
+        tags_by_key = self.tq.kv_list(partition_id=partition_id).get(partition_id, {})
+        keys = list(tags_by_key)
+        if not keys:
+            return []
+        data = self.tq.kv_batch_get(keys=keys, partition_id=partition_id)
+        rows = self._rows_from_tq_data(data, len(keys))
+        samples = []
+        for key, row in zip(keys, rows):
+            copied = dict(row)
+            copied['sample_id'] = key
+            copied['metadata'] = dict(tags_by_key.get(key) or {})
+            samples.append(copied)
+        return samples
+
+    def _update_samples(self, partition_id: str, updates: Dict[str, Dict[str, Any]]) -> None:
+        tags_by_key = self.tq.kv_list(partition_id=partition_id).get(partition_id, {})
+        for key, fields in updates.items():
+            self.tq.kv_put(
+                key=key,
+                partition_id=partition_id,
+                fields=fields,
+                tag=dict(tags_by_key.get(key) or {}),
+            )
+
+    def _sync_partition_status(self, meta: PartitionMetadata) -> None:
+        tags_by_key = self.tq.kv_list(partition_id=meta.partition_id).get(meta.partition_id, {})
+        for key, tag in tags_by_key.items():
+            updated = dict(tag)
+            updated.update(meta.tag())
+            self.tq.kv_put(key=key, partition_id=meta.partition_id, tag=updated)
+
+    def _load_partition_meta(self) -> None:
+        for partition_id, tags_by_key in self.tq.kv_list().items():
+            tag = next(iter(tags_by_key.values()), None)
+            if not tag:
+                continue
+            meta = self._meta_from_tag(partition_id, tag, num_rows=len(tags_by_key))
+            if meta is not None:
+                self._meta[partition_id] = meta
+
+    @staticmethod
+    def _rows_from_tq_data(data: Any, size: int) -> list[SampleRecord]:
+        if hasattr(data, 'to_dict'):
+            data = data.to_dict()
+        if isinstance(data, dict):
+            rows = [dict() for _ in range(size)]
+            for field_name, value in data.items():
+                values = TransferQueueDataPlane._split_field(value, size)
+                for row, item in zip(rows, values):
+                    row[field_name] = item
+            return rows
+        if isinstance(data, list):
+            return [dict(item) for item in data]
+        return [{'data': data}]
+
+    @staticmethod
+    def _split_field(value: Any, size: int) -> list[Any]:
+        if size == 1:
+            if hasattr(value, '__len__') and not isinstance(value, (str, bytes, dict)):
+                return [value[0]]
+            return [value]
+        if hasattr(value, 'unbind'):
+            return list(value.unbind(0))
+        if hasattr(value, 'tolist'):
+            value = value.tolist()
+        if isinstance(value, list) and len(value) == size:
+            return value
+        return [value for _ in range(size)]
+
+    @staticmethod
+    def _meta_from_tag(partition_id: str, tag: Dict[str, Any], *, num_rows: int) -> Optional[PartitionMetadata]:
+        try:
+            context = TrainingContext(
+                tenant_id=tag['tenant_id'],
+                training_run_id=tag['training_run_id'],
+                base_model_id=tag['base_model_id'],
+                adapter_name=tag['adapter_name'],
+                adapter_revision=tag.get('adapter_revision'),
+                policy_version=int(tag.get('policy_version', 0)),
+                env_type=tag.get('env_type', 'tool_calling'),
+                tool_profile=tag.get('tool_profile', 'default'),
+                reward_type=tag.get('reward_type', 'default'),
+                loss_type=tag.get('loss_type', 'default'),
+                algorithm=tag.get('algorithm', 'grpo'),
+            )
+            return PartitionMetadata(
+                context=context,
+                partition_id=partition_id,
+                policy_version=int(tag.get('policy_version', 0)),
+                target_groups=int(tag.get('target_groups', 0)),
+                ready_groups=int(tag.get('ready_groups', 0)),
+                status=PartitionStatus(tag.get('status', PartitionStatus.OPEN.value)),
+                num_rows=num_rows,
+            )
+        except (KeyError, ValueError):
+            return None

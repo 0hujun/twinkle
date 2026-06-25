@@ -1,7 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Async RL primitives for multi-tenant multi-LoRA agentic training."""
 
-from .data_plane import InMemoryTransferQueueBackend, TransferQueueDataPlane
+from .data_plane import (
+    TransferQueueDataPlane,
+    TransferQueueRuntimeConfig,
+)
 from .pipeline import BaseRLPipeline, BaseRLPipelineConfig
 from .registry import AdapterRegistry
 from .scheduling import (
@@ -32,7 +35,6 @@ __all__ = [
     'BaseRLPipelineConfig',
     'DeficitFairRolloutPolicy',
     'DeficitFairTrainPolicy',
-    'InMemoryTransferQueueBackend',
     'PartitionMetadata',
     'PartitionStatus',
     'PreferCurrentTrainPolicy',
@@ -45,5 +47,6 @@ __all__ = [
     'TrainerWorker',
     'TrainingContext',
     'TransferQueueDataPlane',
+    'TransferQueueRuntimeConfig',
     'WorkConservingRolloutPolicy',
 ]

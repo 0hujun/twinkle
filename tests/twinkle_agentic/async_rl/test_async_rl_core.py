@@ -7,7 +7,6 @@ from twinkle_agentic.async_rl import (
     AdvantageWorker,
     AsyncRollouter,
     DeficitFairRolloutPolicy,
-    InMemoryTransferQueueBackend,
     PartitionStatus,
     PreferCurrentTrainPolicy,
     RewardWorker,
@@ -16,8 +15,11 @@ from twinkle_agentic.async_rl import (
     TrainerWorker,
     TrainingContext,
     TransferQueueDataPlane,
+    TransferQueueRuntimeConfig,
     WorkConservingRolloutPolicy,
 )
+
+from .fakes import FakeTransferQueueClient
 
 
 def make_context(name='a', *, tenant='tenant', run='run', version=0):
@@ -52,9 +54,14 @@ def test_training_context_namespace_and_metadata_validation():
         context.validate_metadata(metadata)
 
 
+def test_default_data_plane_requires_real_transfer_queue_when_not_installed():
+    with pytest.raises(RuntimeError, match='transfer_queue is required'):
+        TransferQueueDataPlane()
+
+
 def test_data_plane_rollout_reward_advantage_and_clear():
     context = make_context('lora')
-    data_plane = TransferQueueDataPlane(InMemoryTransferQueueBackend())
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
     data_plane.init_namespace(context)
     partition = data_plane.create_partition(context, target_groups=1)
 
@@ -77,10 +84,29 @@ def test_data_plane_rollout_reward_advantage_and_clear():
 def test_data_plane_rejects_cross_context_append():
     context = make_context('lora')
     other = make_context('other')
-    data_plane = TransferQueueDataPlane()
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
     partition = data_plane.create_partition(context, target_groups=1)
     with pytest.raises(ValueError, match='belongs to'):
         data_plane.put_rollout_batch(other, partition.partition_id, [make_sample(0)])
+
+
+def test_data_plane_check_capacity_by_row_limits():
+    context = make_context('lora')
+    other = make_context('other')
+    data_plane = TransferQueueDataPlane(
+        tq_client=FakeTransferQueueClient(),
+        tq_config=TransferQueueRuntimeConfig(max_rows=2, max_rows_per_context=1),
+    )
+    assert data_plane.check_capacity(context)
+
+    p0 = data_plane.create_partition(context, target_groups=1)
+    data_plane.put_rollout_batch(context, p0.partition_id, [make_sample(0)], seal=True)
+    assert not data_plane.check_capacity(context)
+    assert data_plane.check_capacity(other)
+
+    p1 = data_plane.create_partition(other, target_groups=1)
+    data_plane.put_rollout_batch(other, p1.partition_id, [make_sample(1)], seal=True)
+    assert not data_plane.check_capacity(other)
 
 
 def test_adapter_registry_blocks_current_adapter_during_sync_only():
@@ -103,7 +129,7 @@ def test_adapter_registry_blocks_current_adapter_during_sync_only():
 
 def test_staleness_capacity_by_live_partitions():
     context = make_context('a')
-    data_plane = TransferQueueDataPlane()
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
     manager = StalenessManager(max_staleness=1, target_groups_per_partition=1)
 
     assert manager.get_rollout_capacity(context, data_plane.get_metadata(context)).available_groups == 2
@@ -149,7 +175,7 @@ def test_deficit_fair_rollout_policy_alternates_candidates():
 
 
 def test_prefer_current_train_policy_keeps_current_then_switches():
-    data_plane = TransferQueueDataPlane()
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
     a = make_context('a')
     b = make_context('b', run='run_b')
     pa = data_plane.create_partition(a, target_groups=1)
@@ -164,7 +190,7 @@ def test_prefer_current_train_policy_keeps_current_then_switches():
 
 def test_async_rollouter_and_trainer_worker_mvp_flow():
     context = make_context('lora')
-    data_plane = TransferQueueDataPlane()
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
     registry = AdapterRegistry()
     registry.register(context)
 
