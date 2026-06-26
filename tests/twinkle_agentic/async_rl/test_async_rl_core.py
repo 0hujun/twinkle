@@ -8,6 +8,7 @@ from twinkle_agentic.async_rl import (
     AsyncRollouter,
     DeficitFairRolloutPolicy,
     PartitionStatus,
+    PromptFeeder,
     PreferCurrentTrainPolicy,
     RewardWorker,
     StalenessManager,
@@ -81,6 +82,18 @@ def test_data_plane_rollout_reward_advantage_and_clear():
     assert data_plane.list_partitions(context)[0].status == PartitionStatus.CLEARED
 
 
+def test_data_plane_partition_id_is_rollout_step_not_policy_version():
+    context = make_context('lora', version=3)
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+
+    partition = data_plane.create_partition(context, target_groups=1)
+
+    assert partition.partition_id == 'tenant/run/lora/train_0'
+    assert partition.policy_version == 3
+    next_partition = data_plane.create_partition(context, target_groups=1)
+    assert next_partition.partition_id == 'tenant/run/lora/train_1'
+
+
 def test_data_plane_rejects_cross_context_append():
     context = make_context('lora')
     other = make_context('other')
@@ -143,6 +156,39 @@ def test_staleness_capacity_by_live_partitions():
     capacity = manager.get_rollout_capacity(context, data_plane.get_metadata(context))
     assert capacity.available_groups == 0
     assert capacity.action == 'sleep'
+
+
+def test_staleness_allows_filling_current_open_partition_at_limit():
+    context = make_context('a')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    manager = StalenessManager(max_staleness=0, target_groups_per_partition=2)
+
+    partition = data_plane.create_partition(context, target_groups=2)
+    data_plane.put_rollout_batch(context, partition.partition_id, [make_sample(0)], seal=False)
+
+    capacity = manager.get_rollout_capacity(context, data_plane.get_metadata(context))
+    assert capacity.available_groups == 1
+    assert capacity.action == 'submit'
+
+
+def test_data_plane_allows_mixed_policy_versions_inside_open_partition():
+    context_v0 = make_context('lora', version=0)
+    context_v1 = context_v0.with_policy_version(1, adapter_revision='/tmp/lora-v1')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+
+    partition = data_plane.create_partition(context_v0, target_groups=2)
+    data_plane.put_rollout_batch(context_v0, partition.partition_id, [make_sample(0)], seal=False)
+    meta = data_plane.put_rollout_batch(context_v1, partition.partition_id, [make_sample(1)], seal=False)
+
+    assert meta.status == PartitionStatus.ROLLOUT_DONE
+    rows = data_plane.build_streaming_dataloader(context_v1, partition.partition_id)
+    assert [row['metadata']['policy_version'] for row in rows] == [0, 1]
+    assert rows[0]['metadata']['partition_policy_version'] == 0
+
+    reward_worker = RewardWorker(data_plane=data_plane, reward_registry={'constant': lambda trajectories, **_: [1.0, 1.0]})
+    reward_worker.run_once(context_v1)
+    AdvantageWorker(data_plane=data_plane).run_once(context_v1)
+    assert data_plane.list_train_ready_partitions()[0].partition_id == partition.partition_id
 
 
 def test_work_conserving_rollout_policy_prefers_less_live_work():
@@ -211,12 +257,22 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
         max_concurrent_groups=1,
     )
     rollouter.add_pending(context, [make_sample(0)])
-    meta = asyncio.run(rollouter.step())
-    assert meta is not None
+    result = asyncio.run(rollouter.step())
+    assert result is not None
+    assert result.component == 'rollouter'
+    assert result.kind == 'rollout'
+    meta = result.metadata
     assert meta.status == PartitionStatus.ROLLOUT_DONE
+    assert meta.partition_id == context.partition_id(0)
 
-    RewardWorker(data_plane=data_plane, reward_registry={'constant': lambda trajectories, **_: [1.0]}).run_once(context)
-    AdvantageWorker(data_plane=data_plane).run_once(context)
+    reward_result = RewardWorker(
+        data_plane=data_plane,
+        reward_registry={'constant': lambda trajectories, **_: [1.0]},
+        contexts=[context],
+    ).step()
+    assert reward_result.kind == 'reward'
+    advantage_result = AdvantageWorker(data_plane=data_plane, contexts=[context]).step()
+    assert advantage_result.kind == 'advantage'
 
     received = []
 
@@ -232,9 +288,69 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
         train_partition_fn=train_fn,
         receive_weights_fn=lambda ctx: received.append(ctx),
     )
-    trained = trainer.run_once()
-    assert trained is not None
+    train_result = trainer.step()
+    assert train_result is not None
+    assert train_result.kind == 'train'
+    assert trainer.run_once() is None
     assert received[0].policy_version == 1
     assert received[0].adapter_revision == '/tmp/adapter-lora-v1'
     assert data_plane.list_partitions(context)[0].status == PartitionStatus.CLEARED
     assert registry.get(context).live_partitions == set()
+
+
+def test_async_rollouter_accumulates_prompt_groups_into_one_train_partition():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = AdapterRegistry()
+    registry.register(context)
+
+    class EchoRollout:
+        def __call__(self, trajectories, **kwargs):
+            return [dict(trajectory) for trajectory in trajectories]
+
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        adapter_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=0, target_groups_per_partition=2),
+        rollout=EchoRollout(),
+        max_concurrent_groups=1,
+        target_groups_per_partition=2,
+    )
+    rollouter.enqueue_prompt_groups(context, [make_sample(0), make_sample(1)])
+
+    first = asyncio.run(rollouter.step()).metadata
+    first_status = first.status
+    second = asyncio.run(rollouter.step()).metadata
+
+    assert first.partition_id == second.partition_id == context.partition_id(0)
+    assert first_status == PartitionStatus.OPEN
+    assert second.status == PartitionStatus.ROLLOUT_DONE
+    assert data_plane.list_partitions(context)[0].num_rows == 2
+
+
+def test_prompt_feeder_is_pipeline_source_component():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = AdapterRegistry()
+    registry.register(context)
+
+    class NoopRollout:
+        def __call__(self, trajectories, **kwargs):
+            return trajectories
+
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        adapter_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=0, target_groups_per_partition=1),
+        rollout=NoopRollout(),
+    )
+    feeder = PromptFeeder(context=context, dataloader=[[make_sample(0)]], rollouter=rollouter)
+
+    result = feeder.step()
+
+    assert result.component == 'prompt_feeder'
+    assert result.kind == 'prompt'
+    assert result.count == 1
+    assert rollouter.pending_prompt_group_count(context) == 1
+    assert feeder.step() is None
+    assert feeder.exhausted

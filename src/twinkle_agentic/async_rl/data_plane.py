@@ -68,8 +68,11 @@ class TransferQueueDataPlane:
 
     def next_partition_id(self, context: TrainingContext) -> str:
         with self._lock:
+            self._load_partition_meta()
             train_id = self._next_train_id[context.key]
-            self._next_train_id[context.key] += 1
+            while context.partition_id(train_id) in self._meta:
+                train_id += 1
+            self._next_train_id[context.key] = train_id + 1
             return context.partition_id(train_id)
 
     def create_partition(
@@ -80,13 +83,17 @@ class TransferQueueDataPlane:
         partition_id: Optional[str] = None,
     ) -> PartitionMetadata:
         partition_id = partition_id or self.next_partition_id(context)
-        meta = PartitionMetadata(
-            context=context,
-            partition_id=partition_id,
-            policy_version=context.policy_version,
-            target_groups=target_groups,
-        )
         with self._lock:
+            self._load_partition_meta()
+            existing = self._meta.get(partition_id)
+            if existing is not None:
+                raise ValueError(f'partition already exists: {partition_id}')
+            meta = PartitionMetadata(
+                context=context,
+                partition_id=partition_id,
+                policy_version=context.policy_version,
+                target_groups=target_groups,
+            )
             self._meta[partition_id] = meta
         return meta
 
@@ -105,6 +112,8 @@ class TransferQueueDataPlane:
                 meta = self.create_partition(context, target_groups=ready_groups, partition_id=partition_id)
             if meta.context.key != context.key:
                 raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
+            if meta.status != PartitionStatus.OPEN:
+                raise ValueError(f'partition {partition_id} is not open for rollout append: {meta.status}')
             keys = []
             for idx, trajectory in enumerate(trajectories):
                 sample = dict(trajectory)
@@ -172,7 +181,7 @@ class TransferQueueDataPlane:
             raise ValueError(f'reward count {len(rewards)} does not match sample count {len(samples)}')
         updates = {}
         for sample, reward in zip(samples, rewards):
-            context.validate_metadata(sample.get('metadata') or {})
+            context.validate_metadata(sample.get('metadata') or {}, strict_policy_version=False)
             updates[sample['sample_id']] = {field_name: reward}
         self._update_samples(partition_id, updates)
         meta = self._meta[partition_id]
@@ -198,7 +207,7 @@ class TransferQueueDataPlane:
             returns = advantages
         updates = {}
         for sample, advantage, ret in zip(samples, advantages, returns):
-            context.validate_metadata(sample.get('metadata') or {})
+            context.validate_metadata(sample.get('metadata') or {}, strict_policy_version=False)
             updates[sample['sample_id']] = {'advantages': advantage, 'returns': ret}
         self._update_samples(partition_id, updates)
         meta = self._meta[partition_id]
@@ -344,7 +353,7 @@ class TransferQueueDataPlane:
             return PartitionMetadata(
                 context=context,
                 partition_id=partition_id,
-                policy_version=int(tag.get('policy_version', 0)),
+                policy_version=int(tag.get('partition_policy_version', tag.get('policy_version', 0))),
                 target_groups=int(tag.get('target_groups', 0)),
                 ready_groups=int(tag.get('ready_groups', 0)),
                 status=PartitionStatus(tag.get('status', PartitionStatus.OPEN.value)),

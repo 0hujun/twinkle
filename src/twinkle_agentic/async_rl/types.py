@@ -115,9 +115,14 @@ class PartitionMetadata:
 
     def tag(self) -> Dict[str, Any]:
         tag = self.context.metadata()
+        # Sample-level policy_version / adapter_revision must remain attached
+        # to each row. Partition tags carry lifecycle state and the version that
+        # opened the partition, but must not overwrite row generation metadata.
+        tag.pop('policy_version', None)
+        tag.pop('adapter_revision', None)
         tag.update({
             'partition_id': self.partition_id,
-            'policy_version': self.policy_version,
+            'partition_policy_version': self.policy_version,
             'target_groups': self.target_groups,
             'ready_groups': self.ready_groups,
             'status': self.status.value,
@@ -182,6 +187,14 @@ class RolloutContextState:
     @property
     def context_key(self) -> str:
         return self.context.key
+
+
+@dataclass(frozen=True)
+class ComponentResult:
+    component: str
+    kind: str
+    metadata: Optional[PartitionMetadata] = None
+    count: int = 0
 
 
 SampleRecord = Dict[str, Any]

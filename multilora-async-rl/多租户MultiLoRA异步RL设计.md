@@ -84,6 +84,8 @@ adapter_revision:
 
 policy_version:
   rollout 使用的策略版本。每次 train_k 完成训练并同步权重后递增。
+  policy_version 是 sample 级元数据，不是 partition 唯一键。
+  一个 train_k 可以包含不同 policy_version 生成的 samples，但每条 sample 必须记录自己的 policy_version 和 old_logps。
 
 env_type:
   环境类型。第一版只作为兼容和预留字段，默认可设为 tool_calling。
@@ -99,7 +101,133 @@ loss_type / algorithm:
   训练算法和 loss 选择，例如 grpo、ppo、dapo。
 ```
 
-### 2.2 namespace
+### 2.2 AdapterRegistry 与 AdapterRecord
+
+`TrainingContext` 和 `AdapterRegistry` 的边界必须分清：
+
+```text
+TrainingContext:
+  静态身份与路由信息。
+  用来回答“这条数据/请求属于哪个 tenant、哪个 training_run、哪个 adapter、哪个 reward/loss”。
+
+AdapterRegistry:
+  运行时状态表。
+  用来回答“这个 adapter 当前能不能 rollout、能不能 train、当前权重版本是多少、有哪些 live partitions”。
+```
+
+二者通过 `TrainingContext.key` 建立关系：
+
+```python
+TrainingContext.key = "{tenant_id}/{training_run_id}/{adapter_name}"
+
+AdapterRegistry.records[TrainingContext.key] -> AdapterRecord
+```
+
+`TrainingContext` 不应该承载可变运行状态。下面这些字段由 `AdapterRecord` 管理：
+
+```text
+policy_version:
+  当前 adapter 最新可 rollout 的策略版本。训练并同步完一个 train_k 后递增。
+
+adapter_revision:
+  当前 adapter 最新 checkpoint / adapter_path。
+
+live_partitions:
+  当前尚未 clear 的 train_k partitions。
+
+in_flight_rollouts:
+  当前正在生成、尚未写完的 rollout prompt group 数。
+
+training_partition:
+  当前正在训练的 train_k。一个 adapter 同一时刻最多训练一个 partition。
+
+sync_in_progress:
+  当前 adapter 是否正在权重同步。同步期间阻塞该 adapter 的新 rollout / train。
+
+state:
+  adapter 生命周期状态，例如 ACTIVE / FAILED / CANCELLED。
+```
+
+运行时典型访问方式：
+
+```python
+context = TrainingContext(...)
+record = adapter_registry.register(context)
+
+current = adapter_registry.get(context)
+rollout_context = context.with_policy_version(
+    current.policy_version,
+    current.adapter_revision,
+)
+```
+
+### 2.3 AdapterRecord 状态转换
+
+`AdapterRecord.state` 只表示 adapter 的高层生命周期；`in_flight_rollouts`、`training_partition`、`sync_in_progress` 和 `live_partitions` 是更细的运行时状态。当前第一版核心状态转换如下：
+
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE: register(context)
+
+    ACTIVE --> ACTIVE: on_rollout_started / in_flight_rollouts += 1
+    ACTIVE --> ACTIVE: on_rollout_finished / in_flight_rollouts -= 1
+    ACTIVE --> ACTIVE: on_partition_created / live_partitions.add(train_k)
+    ACTIVE --> ACTIVE: on_partition_cleared / live_partitions.remove(train_k)
+
+    ACTIVE --> TRAINING: on_train_started(train_k)
+    TRAINING --> ACTIVE: on_train_finished(train_k)
+
+    ACTIVE --> SYNCING: on_weight_sync_started()
+    SYNCING --> ACTIVE: on_weight_sync_finished(adapter_revision)\npolicy_version += 1
+
+    ACTIVE --> FAILED: mark_failed(error)
+    TRAINING --> FAILED: mark_failed(error)
+    SYNCING --> FAILED: mark_failed(error)
+    FAILED --> [*]
+```
+
+实现上 `TRAINING` / `SYNCING` 不一定是 `AdapterState` 枚举值，而是由字段表达：
+
+```text
+TRAINING:
+  record.training_partition is not None
+
+SYNCING:
+  record.sync_in_progress == True
+
+FAILED:
+  record.state == FAILED
+```
+
+因此调度判断不是只看一个 state 字段，而是组合判断：
+
+```text
+can_accept_rollout(context):
+  record.state == ACTIVE
+  and not record.sync_in_progress
+
+can_train(context):
+  record.state == ACTIVE
+  and not record.sync_in_progress
+  and record.training_partition is None
+```
+
+事件与字段更新关系：
+
+| 事件 | 更新字段 | 作用 |
+|---|---|---|
+| `register(context)` | 创建 `AdapterRecord` | 注册一个 LoRA 训练上下文 |
+| `on_rollout_started(context)` | `in_flight_rollouts += 1` | 标记有 rollout task 在途 |
+| `on_rollout_finished(context)` | `in_flight_rollouts -= 1` | 释放 rollout 在途计数 |
+| `on_partition_created(context, train_k)` | `live_partitions.add(train_k)` | 参与 staleness / 容量控制 |
+| `on_partition_cleared(context, train_k)` | `live_partitions.remove(train_k)` | 释放 staleness / TQ 容量 |
+| `on_train_started(context, train_k)` | `training_partition = train_k` | 阻止同 adapter 并发训练多个 partition |
+| `on_train_finished(context, train_k)` | `training_partition = None` | 释放训练占用 |
+| `on_weight_sync_started(context)` | `sync_in_progress = True` | 阻塞该 adapter 新 rollout / train |
+| `on_weight_sync_finished(context, adapter_revision)` | `policy_version += 1`, `adapter_revision = ...`, `sync_in_progress = False` | 推进权重版本 |
+| `mark_failed(context, error)` | `state = FAILED`, `last_error = error` | 从调度中剔除该 adapter |
+
+### 2.4 namespace
 
 TransferQueue 中的数据必须按 `TrainingContext` 生成 namespace：
 
@@ -116,16 +244,32 @@ tenant_b/browser_rl_003/browser_lora/train_2
 
 文档中可以继续使用 `train_k` 描述逻辑生命周期，但底层写入、读取、claim、ack、clear 都必须带完整 namespace。
 
-### 2.3 隔离边界
+第一版采用严格的 train_k 与 TQ partition 一一对应关系：
+
+```text
+train_k == TQ partition suffix
+
+train_id = 3
+  -> partition_id = {tenant_id}/{training_run_id}/{adapter_name}/train_3
+```
+
+因此同一个 `(tenant_id, training_run_id, adapter_name, train_k)` 只能存在一个 live partition。该 partition 处于 `OPEN` 时，AsyncRollouter 可以继续向其中追加 prompt groups；一旦达到 `target_groups_per_partition` 并进入 `ROLLOUT_DONE`，不能继续追加 rollout 数据。
+
+`policy_version` 不决定 partition id。它记录每条 sample 由哪个 rollout 权重版本生成。同一个 `train_k` 可以混合多个 `policy_version`，但 partition 内仍然不能混 tenant、training_run、adapter、reward_type、loss_type 或 algorithm。
+
+### 2.5 隔离边界
 
 第一版不支持跨 context 混合训练：
 
 ```text
 同一个 train_k:
-  只能属于一个 tenant_id / training_run_id / adapter_name / policy_version。
+  只能属于一个 tenant_id / training_run_id / adapter_name。
+  只能对应一个 TransferQueue partition。
+  可以包含多个 policy_version 的 samples，但每条 sample 必须保留自己的 policy_version / adapter_revision / old_logps。
 
 同一个 GRPO group:
-  只能来自同一个 prompt、同一个 adapter、同一个 policy_version。
+  只能来自同一个 prompt、同一个 adapter。是否允许混 policy_version 由 advantage 规则决定；
+  GRPO 默认建议同一个 group 内保持同一个 policy_version。
 
 同一个 optimizer batch:
   只能来自同一个 loss schema 和 reward schema。
@@ -147,7 +291,7 @@ tenant_b/browser_rl_003/browser_lora/train_2
 | 5 | `capacity / throttle hint` | `StalenessManager` 按当前 adapter 的 `max_staleness` 计算还能继续提交多少 rollout，以及是否需要 throttle 或 sleep。 |
 | 6 | `can_accept_rollout(context)` | `AsyncRollouter` 询问 `AdapterRegistry` 当前 adapter 是否处于可 rollout 状态，并检查 `in_flight_rollouts`、`live_partitions`、同步状态等运行时状态。 |
 | 7 | `check_capacity(context)` | `AsyncRollouter` 在提交前向 `TransferQueueDataPlane` 检查目标 namespace 的 TQ 容量是否还能接收新的 rollout rows。 |
-| 8 | `run_rollout(context)` | `AsyncRollouter` 选择一个 `TrainingContext` 后启动 rollout task。一次 submit batch 内只包含同一个 tenant/run/adapter/policy_version。 |
+| 8 | `run_rollout(context)` | `AsyncRollouter` 选择一个 `TrainingContext` 后启动 rollout task。一次 submit batch 内只包含同一个 tenant/run/adapter；`policy_version` 作为每条 sample 的生成版本写入 metadata。 |
 | 9 | `call native / remote tool` | `MultiTurnRollout` 在多轮交互中通过 `ToolManager` 调用 native tool 或 remote tool API。第一版不 import 用户 Env Python 代码。 |
 | 10 | `sample(adapter_name, policy_version)` | `MultiTurnRollout` 调用 `vLLMSampler` 生成模型回复。请求必须携带 `adapter_name` 和 `policy_version`，用于多 LoRA 路由和版本追踪。 |
 | 11 | `put_rollout_batch(context, train_k)` | rollout 完成一批 trajectory group 后，由 `AsyncRollouter` 写入对应 `train_k` partition。写入时附带 sample metadata。 |
@@ -155,13 +299,13 @@ tenant_b/browser_rl_003/browser_lora/train_2
 | 13 | `claim / append reward` | `RewardWorker` claim rollout-ready 数据，按 `reward_type` 计算 reward，并追加 reward 字段。 |
 | 14 | `claim / append advantage` | `AdvantageWorker` claim reward-ready 数据，按算法计算 advantage/return，并追加字段。满足训练条件后将 partition 标记为 `TRAIN_READY`。 |
 | 15 | `list_train_ready_partitions()` | `TrainerScheduler` 从 `TransferQueueDataPlane` 查询可训练 partition 候选集合。候选必须已经完成 rollout、reward、advantage。 |
-| 16 | `next_partition(train_k)` | `TrainerScheduler` 选择下一个训练 partition。选择结果必须保持 `train_k` 内 adapter、policy_version、loss/reward schema 一致。 |
+| 16 | `next_partition(train_k)` | `TrainerScheduler` 选择下一个训练 partition。选择结果必须保持 `train_k` 内 adapter、loss/reward schema 一致；允许 rows 来自不同 `policy_version`。 |
 | 17 | `iter(train_k)` | `TrainerWorker` 针对选中的 `train_k` 构建 `StreamingDataset / StreamingDataLoader`，开始按 batch 读取训练数据。 |
 | 18 | `read / ack rows` | `StreamingDataset / StreamingDataLoader` 通过 `TransferQueueDataPlane` 从 TQ 读取 rows，并对已消费数据做 ack/progress 更新。 |
-| 19 | `train_k done` | `TrainerWorker` 完成当前 partition 的全部 optimizer steps 后，通知 `BaseRLPipeline` 当前 `train_k` 已训练完成。 |
-| 20 | `sync_weights(adapter)` | `BaseRLPipeline` 触发 `CheckpointEngineManager` 导出当前 adapter 的新权重。权重同步粒度是一个 `train_k`，不是每个 optimizer step。 |
+| 19 | `train_k done` | `TrainerWorker` 完成当前 partition 的全部 optimizer steps。`BaseRLPipeline` 不直接执行训练逻辑，只观察组件 step 结果。 |
+| 20 | `sync_weights(adapter)` | `TrainerWorker` 在 `train_k` 边界触发当前 adapter 权重保存/同步回调；具体实现由 trainer 组件决定，例如 GRPO trainer 保存 LoRA 到 `adapter_path`。 |
 | 21 | `receive_weights(adapter, version)` | `vLLMSampler` 接收新 adapter 权重，并更新 rollout 侧可用的 `policy_version`。 |
-| 22 | `clear_partition(train_k)` | 权重同步完成后，`BaseRLPipeline` 通过 `TransferQueueDataPlane` 清理已训练完成的 `train_k`，释放 TQ 容量并推进 staleness 窗口。 |
+| 22 | `clear_partition(train_k)` | 权重同步完成后，`TrainerWorker` 通过 `TransferQueueDataPlane` 清理已训练完成的 `train_k`，释放 TQ 容量并推进 staleness 窗口。 |
 
 关键约束：
 
@@ -170,7 +314,8 @@ rollout submit batch:
   只能包含一个 TrainingContext。
 
 train_k:
-  只能包含一个 adapter_name / policy_version / reward_type / loss_type / algorithm。
+  只能包含一个 adapter_name / reward_type / loss_type / algorithm。
+  可以包含多个 policy_version 的 rows。
 
 权重同步:
   训练完一个 train_k 后同步一次 adapter 权重。
@@ -179,7 +324,65 @@ partition 清理:
   必须在训练完成并且 rollout 侧权重同步成功后执行。
 ```
 
-### 3.1 时序图
+### 3.1 Pipeline 与组件图
+
+`BaseRLPipeline` 的定位是运行时控制面，而不是算法逻辑容器。它负责：
+
+```text
+1. 初始化共享资源：TrainingContext / TransferQueueDataPlane / AdapterRegistry / StalenessManager
+2. 创建组件：PromptFeeder / AsyncRollouter / RewardWorker / AdvantageWorker / TrainerWorker
+3. 创建角色图：默认 GRPO 使用 `create_grpo_roles()`；其他算法由子类覆盖 `create_roles()`
+4. 按顺序调用 component.step()
+5. 关闭组件和共享资源
+```
+
+`BaseRLPipeline` 的构造入口只接收 `config`。模型、rollout、TQ 数据面、registry、staleness manager、reward/advantage 函数、调度策略等都由 `build_*()` 方法根据 config 创建：
+
+```text
+BaseRLPipeline(config)
+  -> build_model()
+  -> build_rollout()
+  -> build_data_plane()
+  -> build_reward_registry()
+  -> build_advantage_fn()
+  -> build_rollout_policy()
+  -> build_train_policy()
+  -> build_prompt_feeders()
+```
+
+测试或特殊任务如果需要 fake 资源，不应通过构造函数额外传入一组 runtime 属性，而应通过子类覆盖对应 `build_*()` 方法。这样生产初始化路径始终是 config-driven 的。
+
+默认 GRPO 组件图是：
+
+```text
+PromptFeeder
+  -> AsyncRollouter
+  -> RewardWorker
+  -> AdvantageWorker
+  -> MultiLoraGRPOTrainerWorker
+```
+
+第一版 server-side GRPO 具体实现类为：
+
+```python
+twinkle_agentic.async_rl.AsyncMultiLoraGRPOPipeline
+```
+
+该类继承 `BaseRLPipeline`，构造入口为 `cfg/model_mesh/sampler_mesh`，内部通过 `build_model()`、`build_rollout()`、`build_data_plane()`、`build_prompt_feeders()`、`build_reward_registry()` 和 `build_advantage_fn()` 从 YAML 配置创建资源。
+
+不同算法不应该在 `BaseRLPipeline` 中增加大量训练细节分支。`BaseRLPipeline.create_roles()` 只提供默认 GRPO 角色图；DPO、SFT 或新的 RL 算法应通过子类覆盖 `create_roles()`，在该方法里创建自己的角色图。
+
+```text
+DPO:
+  PairFeeder -> DPOTrainerWorker
+
+GRPO:
+  PromptFeeder -> AsyncRollouter -> RewardWorker -> AdvantageWorker -> GRPOTrainerWorker
+```
+
+因此 `BaseRLPipeline` 学习 Relax Controller 的地方是“控制面负责启动角色，角色自治运行”，但不把具体算法训练细节放进控制面。
+
+### 3.2 时序图
 
 ```mermaid
 sequenceDiagram
@@ -235,11 +438,11 @@ sequenceDiagram
         TS->>TW: 16 next_partition(train_k)
         TW->>SD: 17 iter(train_k)
         SD->>Q: 18 read / ack rows
-        TW->>P: 19 train_k done
-        P->>CK: 20 sync_weights(adapter)
-        CK-->>P: adapter_weights / checkpoint_path
-        P->>V: 21 receive_weights(adapter, version)
-        P->>Q: 22 clear_partition(train_k)
+        TW->>TW: 19 train_k done
+        TW->>CK: 20 sync_weights(adapter)
+        CK-->>TW: adapter_weights / checkpoint_path
+        TW->>V: 21 receive_weights(adapter, version)
+        TW->>Q: 22 clear_partition(train_k)
     end
 ```
 
@@ -509,6 +712,35 @@ multi_lora:
 
 ## 5. Worker 租户隔离原则
 
+### 5.0 Pipeline Component 模型
+
+第一版将热路径执行单元统一建模为 pipeline component：
+
+```python
+step() -> ComponentResult | None
+is_idle() -> bool
+shutdown() -> None
+```
+
+`BaseRLPipeline` 是控制面，只负责初始化资源、创建组件、按顺序调用 `component.step()` 和关闭组件；它不直接搬运 reward/advantage/train 数据。
+
+| 组件 | 类型 | 调度单位 | 数据入口 | 数据出口 | multi-LoRA 适配方式 |
+|---|---|---|---|---|---|
+| `PromptFeeder` | source component | prompt batch | `twinkle.dataloader.DataLoader` | `AsyncRollouter` pending queue | 每个 `TrainingContext` 一个 feeder |
+| `AsyncRollouter` | rollout producer | prompt group | pending queue | TQ `train_k` rollout rows | `pending_by_context` + staleness gating |
+| `RewardWorker` | TQ transformer | rollout-ready partition | `TransferQueueDataPlane` | reward fields | 按 context 轮询 claim |
+| `AdvantageWorker` | TQ transformer | reward-ready partition | `TransferQueueDataPlane` | advantages / returns | 按 context 轮询 claim |
+| `TrainerWorker` | TQ consumer / optimizer | `TRAIN_READY train_k` | TQ-backed dataloader | adapter weights / partition clear | `TrainerScheduler` 选择 partition |
+
+因此 multi-LoRA 支撑不是放在单个 scheduler 里，而是每个组件都遵守同一组约束：
+
+```text
+1. 输入必须绑定 TrainingContext。
+2. 内部状态必须按 context.key 隔离。
+3. 输出必须写回同一个 context namespace。
+4. 一个 train_k 不混 adapter。
+```
+
 多租户模式下，worker 可以共享进程池，但每次执行必须以 `TrainingContext` 为隔离边界。隔离不是必须“一租户一个 worker”，而是必须保证 claim、compute、append、ack 都不能跨 namespace。
 
 ### 5.1 通用隔离要求
@@ -538,10 +770,11 @@ permission:
 sample.tenant_id == context.tenant_id
 sample.training_run_id == context.training_run_id
 sample.adapter_name == context.adapter_name
-sample.policy_version == context.policy_version
 sample.reward_type == context.reward_type
 sample.loss_type == context.loss_type
 ```
+
+`sample.policy_version` 不要求等于当前 `context.policy_version`。它表示该 row 由哪个 rollout 权重版本生成，trainer/reward/advantage 只能把它作为元数据和 loss 输入的一部分保留，不能用当前最新版本覆盖它。
 
 ### 5.2 RewardWorker 隔离
 

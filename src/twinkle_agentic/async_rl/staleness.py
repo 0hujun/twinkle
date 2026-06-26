@@ -24,8 +24,6 @@ class StalenessManager:
     ) -> RolloutCapacity:
         scoped = [p for p in partitions if p.context.key == context.key and p.status != PartitionStatus.CLEARED]
         live_count = len(scoped)
-        if live_count >= self.max_live_partitions:
-            return RolloutCapacity(0, action='sleep', reason='max_staleness_reached', sleep_seconds=self.sleep_seconds)
 
         open_partitions = [p for p in scoped if p.status == PartitionStatus.OPEN]
         if open_partitions:
@@ -33,6 +31,9 @@ class StalenessManager:
             remaining = max(0, self.target_groups_per_partition - current.ready_groups)
             if remaining > 0:
                 return RolloutCapacity(remaining, action='submit')
+
+        if live_count >= self.max_live_partitions:
+            return RolloutCapacity(0, action='sleep', reason='max_staleness_reached', sleep_seconds=self.sleep_seconds)
 
         capacity = (self.max_live_partitions - live_count) * self.target_groups_per_partition
         if capacity <= 0:

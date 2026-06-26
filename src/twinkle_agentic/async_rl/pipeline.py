@@ -5,13 +5,16 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Optional
 
-from .data_plane import TransferQueueDataPlane
+from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
+from .prompt_feeder import PromptFeeder
 from .registry import AdapterRegistry
 from .staleness import StalenessManager
 from .types import PartitionMetadata, SampleRecord, TrainingContext
 from .workers import (
     AdvantageWorker,
     AsyncRollouter,
+    MultiLoraGRPOTrainConfig,
+    MultiLoraGRPOTrainerWorker,
     RewardWorker,
     ToolManagerFactory,
     TrainerScheduler,
@@ -25,10 +28,12 @@ class BaseRLPipelineConfig:
     """Runtime knobs for the MVP async RL pipeline.
 
     The first version follows the short_math_grpo client pattern:
-    train one LoRA adapter with MultiLoraTransformersModel, save adapter
-    weights after each train partition, and pass that saved path to rollout.
+    train one or more LoRA adapters with MultiLoraTransformersModel, save
+    adapter weights after each train partition, and pass that saved path to
+    rollout.
     """
 
+    training_contexts: Optional[list[TrainingContext]] = None
     tenant_id: str = 'default_tenant'
     training_run_id: str = 'default_run'
     base_model_id: str = ''
@@ -45,11 +50,13 @@ class BaseRLPipelineConfig:
     advantage_batch_size: int = 1024
     max_train_partitions: Optional[int] = None
     save_name_prefix: str = 'async-rl-sampler-weights'
+    adapter_checkpoint_dir: Optional[str] = None
     save_optimizer: bool = False
     is_sampler_checkpoint: bool = True
     max_grad_norm: float = 1.0
     norm_type: int = 2
     train_kwargs: Dict[str, Any] = field(default_factory=dict)
+    tq_config: Optional[TransferQueueRuntimeConfig] = None
 
 
 class BaseRLPipeline:
@@ -64,22 +71,95 @@ class BaseRLPipeline:
         self,
         *,
         config: BaseRLPipelineConfig,
-        model: Any,
-        rollout: Any,
-        reward_registry: Dict[str, Callable[..., list[float]]],
-        data_plane: Optional[TransferQueueDataPlane] = None,
-        adapter_registry: Optional[AdapterRegistry] = None,
-        staleness_manager: Optional[StalenessManager] = None,
-        tool_manager_factory: Optional[ToolManagerFactory] = None,
-        advantage_fn: Optional[Callable[[list[SampleRecord], TrainingContext], tuple[list[float], list[float]]]] = None,
-        rollout_policy: Optional[Any] = None,
-        train_policy: Optional[Any] = None,
-        train_partition_fn: Optional[Callable[[TrainingContext, str, Any], TrainerStepResult | Dict[str, Any] | None]] = None,
-        receive_weights_fn: Optional[Callable[[TrainingContext], None]] = None,
     ):
         self.config = config
-        self.model = model
-        self.context = TrainingContext(
+        self.model = None
+        self.rollout = None
+        self.reward_registry: Dict[str, Callable[..., list[float]]] = {}
+        self.data_plane = None
+        self.adapter_registry = None
+        self.staleness_manager = None
+        self.tool_manager_factory = None
+        self.advantage_fn = None
+        self.rollout_policy = None
+        self.train_policy = None
+        self.train_partition_fn = None
+        self.receive_weights_fn = None
+
+        self.build_components()
+        self.allocate_resources()
+        self.create_roles()
+
+    def build_components(self) -> None:
+        """Create model and rollout components."""
+        if self.model is None:
+            self.model = self.build_model()
+        if self.requires_rollout() and self.rollout is None:
+            self.rollout = self.build_rollout()
+        if self.model is None:
+            raise ValueError('BaseRLPipeline requires build_model() or a model override')
+        if self.requires_rollout() and self.rollout is None:
+            raise ValueError('BaseRLPipeline requires build_rollout() or a rollout override')
+
+    def requires_rollout(self) -> bool:
+        """Whether the configured algorithm needs rollout-side components."""
+        return self.config.algorithm.lower() in {'grpo', 'ppo', 'dapo'}
+
+    def build_model(self) -> Any:
+        """Build the train-side model resource.
+
+        Subclasses should override this for YAML-driven jobs.
+        """
+        return None
+
+    def build_rollout(self) -> Any:
+        """Build the rollout implementation resource.
+
+        Subclasses should override this for YAML-driven jobs.
+        """
+        return None
+
+    def build_data_plane(self) -> TransferQueueDataPlane:
+        """Build the TransferQueue data plane resource."""
+        return TransferQueueDataPlane(tq_config=self.config.tq_config)
+
+    def build_reward_registry(self) -> Dict[str, Callable[..., list[float]]]:
+        return {}
+
+    def build_advantage_fn(
+        self,
+    ) -> Optional[Callable[[list[SampleRecord], TrainingContext], tuple[list[float], list[float]]]]:
+        return None
+
+    def build_tool_manager_factory(self) -> Optional[ToolManagerFactory]:
+        return None
+
+    def build_rollout_policy(self) -> Optional[Any]:
+        return None
+
+    def build_train_policy(self) -> Optional[Any]:
+        return None
+
+    def build_train_partition_fn(
+        self,
+    ) -> Optional[Callable[[TrainingContext, str, Any], TrainerStepResult | Dict[str, Any] | None]]:
+        return None
+
+    def build_receive_weights_fn(self) -> Optional[Callable[[TrainingContext], None]]:
+        return None
+
+    def build_prompt_feeders(self) -> list[PromptFeeder]:
+        """Build rollout-side prompt feeders.
+
+        Subclasses can wrap `twinkle.dataloader.DataLoader` instances here.
+        The default is empty so callers may still push prompts explicitly with
+        `submit_rollout_samples()`.
+        """
+        return []
+
+    def build_default_context(self) -> TrainingContext:
+        config = self.config
+        return TrainingContext(
             tenant_id=config.tenant_id,
             training_run_id=config.training_run_id,
             base_model_id=config.base_model_id,
@@ -91,35 +171,164 @@ class BaseRLPipeline:
             tool_profile=config.tool_profile,
         )
 
-        self.data_plane = data_plane or TransferQueueDataPlane()
-        self.adapter_registry = adapter_registry or AdapterRegistry()
-        self.staleness_manager = staleness_manager or StalenessManager(
-            max_staleness=config.max_staleness,
-            target_groups_per_partition=config.target_groups_per_partition,
-        )
-        self.adapter_registry.register(self.context)
-        self.data_plane.init_namespace(self.context)
+    def build_training_contexts(self) -> list[TrainingContext]:
+        """Build the LoRA contexts managed by this pipeline.
 
-        self.rollouter = AsyncRollouter(
+        A context identifies one training run and one LoRA adapter. Multi-LoRA
+        jobs pass multiple contexts; single-LoRA jobs keep using the legacy
+        scalar config fields.
+        """
+        if self.config.training_contexts:
+            return list(self.config.training_contexts)
+        return [self.build_default_context()]
+
+    def allocate_resources(self) -> None:
+        """Initialize shared resources: contexts, TransferQueue data plane, and registries."""
+        config = self.config
+        self.contexts = self.build_training_contexts()
+        if not self.contexts:
+            raise ValueError('BaseRLPipeline requires at least one TrainingContext')
+        context_keys = [context.key for context in self.contexts]
+        if len(context_keys) != len(set(context_keys)):
+            raise ValueError(f'duplicate TrainingContext keys are not allowed: {context_keys}')
+        self.context = self.contexts[0]
+
+        if self.data_plane is None:
+            self.data_plane = self.build_data_plane()
+        if self.adapter_registry is None:
+            self.adapter_registry = AdapterRegistry()
+        if self.staleness_manager is None:
+            self.staleness_manager = StalenessManager(
+                max_staleness=config.max_staleness,
+                target_groups_per_partition=config.target_groups_per_partition,
+            )
+        for context in self.contexts:
+            self.adapter_registry.register(context)
+            self.data_plane.init_namespace(context)
+
+    def create_roles(self) -> None:
+        """Create runtime roles for the default GRPO pipeline."""
+        algorithm = self.config.algorithm.lower()
+        if algorithm != 'grpo':
+            raise NotImplementedError(
+                f'BaseRLPipeline only defines default roles for algorithm={algorithm!r}. '
+                'Override create_roles() in an algorithm-specific pipeline.')
+        self.create_grpo_roles()
+
+    def create_grpo_roles(self) -> None:
+        """Create the default Multi-LoRA GRPO component graph."""
+        config = self.config
+        if not self.reward_registry:
+            self.reward_registry = self.build_reward_registry()
+        self.advantage_fn = self.build_advantage_fn()
+        self.tool_manager_factory = self.build_tool_manager_factory()
+        self.rollout_policy = self.build_rollout_policy()
+        self.train_policy = self.build_train_policy()
+        self.train_partition_fn = self.build_train_partition_fn()
+        self.receive_weights_fn = self.build_receive_weights_fn()
+        self.rollouter = self.build_rollouter(
+            tool_manager_factory=self.tool_manager_factory,
+            rollout_policy=self.rollout_policy,
+        )
+        self.reward_worker = self.build_reward_worker()
+        self.advantage_worker = self.build_advantage_worker(advantage_fn=self.advantage_fn)
+        self.trainer_scheduler = self.build_trainer_scheduler(train_policy=self.train_policy)
+        self.trainer_worker = self.build_trainer_worker()
+        self.prompt_feeders = self.build_prompt_feeders()
+        self.components = self.build_pipeline_components()
+
+    def build_rollouter(
+        self,
+        *,
+        tool_manager_factory: Optional[ToolManagerFactory],
+        rollout_policy: Optional[Any],
+    ) -> AsyncRollouter:
+        config = self.config
+        return AsyncRollouter(
             data_plane=self.data_plane,
             adapter_registry=self.adapter_registry,
             staleness_manager=self.staleness_manager,
-            rollout=rollout,
+            rollout=self.rollout,
             tool_manager_factory=tool_manager_factory,
             rollout_policy=rollout_policy,
             max_concurrent_groups=config.max_concurrent_groups,
             target_groups_per_partition=config.target_groups_per_partition,
         )
-        self.reward_worker = RewardWorker(data_plane=self.data_plane, reward_registry=reward_registry)
-        self.advantage_worker = AdvantageWorker(data_plane=self.data_plane, advantage_fn=advantage_fn)
-        self.trainer_scheduler = TrainerScheduler(adapter_registry=self.adapter_registry, train_policy=train_policy)
-        self.trainer_worker = TrainerWorker(
+
+    def build_reward_worker(self) -> RewardWorker:
+        return RewardWorker(
+            data_plane=self.data_plane,
+            reward_registry=self.reward_registry,
+            contexts=self.contexts,
+            batch_size=self.config.reward_batch_size,
+        )
+
+    def build_advantage_worker(
+        self,
+        *,
+        advantage_fn: Optional[Callable[[list[SampleRecord], TrainingContext], tuple[list[float], list[float]]]],
+    ) -> AdvantageWorker:
+        return AdvantageWorker(
+            data_plane=self.data_plane,
+            contexts=self.contexts,
+            batch_size=self.config.advantage_batch_size,
+            advantage_fn=advantage_fn,
+        )
+
+    def build_trainer_scheduler(self, *, train_policy: Optional[Any]) -> TrainerScheduler:
+        return TrainerScheduler(adapter_registry=self.adapter_registry, train_policy=train_policy)
+
+    def build_trainer_worker(self) -> TrainerWorker:
+        if self.train_partition_fn is not None:
+            return TrainerWorker(
+                data_plane=self.data_plane,
+                adapter_registry=self.adapter_registry,
+                scheduler=self.trainer_scheduler,
+                train_partition_fn=self.train_partition_fn,
+                receive_weights_fn=self.receive_weights_fn,
+            )
+
+        if self.__class__.train_partition is not BaseRLPipeline.train_partition:
+            return TrainerWorker(
+                data_plane=self.data_plane,
+                adapter_registry=self.adapter_registry,
+                scheduler=self.trainer_scheduler,
+                train_partition_fn=self.train_partition,
+                receive_weights_fn=self.receive_weights_fn,
+            )
+
+        return MultiLoraGRPOTrainerWorker(
             data_plane=self.data_plane,
             adapter_registry=self.adapter_registry,
             scheduler=self.trainer_scheduler,
-            train_partition_fn=train_partition_fn or self.train_partition,
-            receive_weights_fn=receive_weights_fn,
+            model=self.model,
+            train_config=MultiLoraGRPOTrainConfig(
+                save_name_prefix=self.config.save_name_prefix,
+                adapter_checkpoint_dir=self.config.adapter_checkpoint_dir,
+                save_optimizer=self.config.save_optimizer,
+                is_sampler_checkpoint=self.config.is_sampler_checkpoint,
+                max_grad_norm=self.config.max_grad_norm,
+                norm_type=self.config.norm_type,
+                train_kwargs=self.config.train_kwargs,
+            ),
+            receive_weights_fn=self.receive_weights_fn,
         )
+
+    def build_pipeline_components(self) -> list[Any]:
+        """Return the component graph run by this pipeline.
+
+        Algorithm-specific pipelines should override this if their roles are
+        not the default GRPO chain. The default graph is:
+
+        PromptFeeder -> AsyncRollouter -> RewardWorker -> AdvantageWorker -> TrainerWorker
+        """
+        return [
+            *self.prompt_feeders,
+            self.rollouter,
+            self.reward_worker,
+            self.advantage_worker,
+            self.trainer_worker,
+        ]
 
     @classmethod
     def build_multilora_model(
@@ -166,19 +375,21 @@ class BaseRLPipeline:
         These are not trainer batches. The trainer only reads samples that have
         already passed rollout/reward/advantage stages from TransferQueue.
         """
-        self.rollouter.add_pending(context or self.current_context(), samples)
+        self.rollouter.enqueue_prompt_groups(context or self.current_context(), samples)
 
     async def step_async(self) -> Dict[str, Optional[PartitionMetadata]]:
-        rollout_meta = await self.rollouter.step()
-        reward_meta = self._run_reward_if_ready()
-        advantage_meta = self._run_advantage_if_ready()
-        train_meta = self.trainer_worker.run_once()
-        return {
-            'rollout': rollout_meta,
-            'reward': reward_meta,
-            'advantage': advantage_meta,
-            'train': train_meta,
-        }
+        step_result = {'rollout': None, 'reward': None, 'advantage': None, 'train': None}
+        self._last_step_had_work = False
+        for component in self.components:
+            result = component.step()
+            if asyncio.iscoroutine(result):
+                result = await result
+            if result is None:
+                continue
+            self._last_step_had_work = True
+            if result.kind in step_result:
+                step_result[result.kind] = result.metadata
+        return step_result
 
     def step(self) -> Dict[str, Optional[PartitionMetadata]]:
         return asyncio.run(self.step_async())
@@ -201,7 +412,9 @@ class BaseRLPipeline:
             if result['train'] is not None:
                 trained += 1
                 idle_steps = 0
-            elif any(value is not None for value in result.values()):
+                if self.should_stop(trained):
+                    break
+            elif self._last_step_had_work or any(value is not None for value in result.values()):
                 idle_steps = 0
             else:
                 idle_steps += 1
@@ -227,57 +440,59 @@ class BaseRLPipeline:
         """Advance workers without adding new rollout prompts."""
         return self.run(max_steps=max_steps)
 
+    def sync_and_clear_completed_partitions(self, metadata: PartitionMetadata) -> None:
+        """Hook for custom pipelines after a train_k is completed.
+
+        The MVP `TrainerWorker` performs adapter save/version update and clear
+        inline. Custom pipelines can override this method together with a
+        custom trainer worker if they need a different sync boundary.
+        """
+        self.data_plane.clear_partition(metadata.context, metadata.partition_id)
+
+    def should_stop(self, trained_partitions: int) -> bool:
+        return self.config.max_train_partitions is not None and trained_partitions >= self.config.max_train_partitions
+
+    def shutdown(self) -> None:
+        for component in getattr(self, 'components', []):
+            shutdown = getattr(component, 'shutdown', None)
+            if shutdown is not None:
+                shutdown()
+        close = getattr(getattr(self, 'data_plane', None), 'close', None)
+        if close is not None:
+            close()
+
     def train_partition(self, context: TrainingContext, partition_id: str, dataloader: Any) -> TrainerStepResult:
-        batch = list(dataloader)
-        inputs = [sample.get('trajectory', sample) for sample in batch]
-        advantages = [sample.get('advantages') for sample in batch if 'advantages' in sample]
-        old_logps = [sample.get('old_logps') for sample in batch if 'old_logps' in sample]
+        """Legacy override hook for custom trainer workers.
 
-        kwargs = dict(self.config.train_kwargs)
-        if advantages and len(advantages) == len(inputs):
-            kwargs.setdefault('advantages', advantages)
-        if old_logps and len(old_logps) == len(inputs):
-            kwargs.setdefault('old_logps', old_logps)
+        The default GRPO train path is implemented by
+        `MultiLoraGRPOTrainerWorker`. Subclasses may still override this method
+        for compatibility; new algorithms should prefer overriding
+        `build_trainer_worker()` or `build_pipeline_components()`.
+        """
+        raise NotImplementedError(
+            'BaseRLPipeline.train_partition is a legacy override hook. '
+            'Use MultiLoraGRPOTrainerWorker or override build_trainer_worker().')
 
-        self.model.forward_backward(inputs=inputs, adapter_name=context.adapter_name, **kwargs)
-        self.model.clip_grad_and_step(
-            adapter_name=context.adapter_name,
-            max_grad_norm=self.config.max_grad_norm,
-            norm_type=self.config.norm_type,
-        )
-        save_result = self.model.save(
-            name=f'{self.config.save_name_prefix}-{context.training_run_id}-{context.adapter_name}',
-            adapter_name=context.adapter_name,
-            save_optimizer=self.config.save_optimizer,
-            is_sampler=self.config.is_sampler_checkpoint,
-        )
-        adapter_revision = getattr(save_result, 'twinkle_path', None)
-        if adapter_revision is None and isinstance(save_result, dict):
-            adapter_revision = save_result.get('twinkle_path') or save_result.get('path')
-        return TrainerStepResult(adapter_revision=adapter_revision)
+    def current_context(self, context: Optional[TrainingContext] = None) -> TrainingContext:
+        base_context = context or self.context
+        record = self.adapter_registry.get(base_context)
+        return base_context.with_policy_version(record.policy_version, record.adapter_revision)
 
-    def _run_reward_if_ready(self) -> Optional[PartitionMetadata]:
-        try:
-            return self.reward_worker.run_once(self.current_context(), batch_size=self.config.reward_batch_size)
-        except LookupError:
-            return None
-
-    def _run_advantage_if_ready(self) -> Optional[PartitionMetadata]:
-        try:
-            return self.advantage_worker.run_once(self.current_context(), batch_size=self.config.advantage_batch_size)
-        except LookupError:
-            return None
-
-    def current_context(self) -> TrainingContext:
-        record = self.adapter_registry.get(self.context)
-        return self.context.with_policy_version(record.policy_version, record.adapter_revision)
+    def current_contexts(self) -> list[TrainingContext]:
+        return [self.current_context(context) for context in self.contexts]
 
     def _is_drained(self) -> bool:
-        context = self.current_context()
-        pending = self.rollouter.pending_by_context.get(context.key)
-        has_pending = bool(pending)
-        active_partitions = [
-            partition for partition in self.data_plane.get_metadata(context)
-            if partition.status.value not in {'CLEARED', 'FAILED', 'CANCELLED'}
-        ]
-        return not has_pending and not active_partitions
+        if any(not component.is_idle() for component in self.components):
+            return False
+        if not hasattr(self, 'rollouter'):
+            return True
+        for context in self.current_contexts():
+            if self.rollouter.pending_prompt_group_count(context) > 0:
+                return False
+            active_partitions = [
+                partition for partition in self.data_plane.get_metadata(context)
+                if partition.status.value not in {'CLEARED', 'FAILED', 'CANCELLED'}
+            ]
+            if active_partitions:
+                return False
+        return True

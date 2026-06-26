@@ -1,6 +1,14 @@
 from types import SimpleNamespace
 
-from twinkle_agentic.async_rl import BaseRLPipeline, BaseRLPipelineConfig, PartitionStatus, TransferQueueDataPlane
+from twinkle_agentic.async_rl import (
+    BaseRLPipeline,
+    BaseRLPipelineConfig,
+    ComponentResult,
+    PartitionStatus,
+    PromptFeeder,
+    TrainingContext,
+    TransferQueueDataPlane,
+)
 
 from .fakes import FakeTransferQueueClient
 
@@ -48,11 +56,46 @@ class FakeMultiLoraModel:
         return SimpleNamespace(twinkle_path=f"/tmp/{kwargs['adapter_name']}-v{len(self.save_calls)}")
 
 
+class FakeGRPOPipeline(BaseRLPipeline):
+
+    def __init__(
+        self,
+        *,
+        config,
+        model,
+        rollout,
+        reward_registry=None,
+        data_plane=None,
+        receive_weights_fn=None,
+    ):
+        self.test_model = model
+        self.test_rollout = rollout
+        self.test_reward_registry = reward_registry or {}
+        self.test_data_plane = data_plane or TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+        self.test_receive_weights_fn = receive_weights_fn
+        super().__init__(config=config)
+
+    def build_model(self):
+        return self.test_model
+
+    def build_rollout(self):
+        return self.test_rollout
+
+    def build_reward_registry(self):
+        return self.test_reward_registry
+
+    def build_data_plane(self):
+        return self.test_data_plane
+
+    def build_receive_weights_fn(self):
+        return self.test_receive_weights_fn
+
+
 def test_base_pipeline_runs_one_multilora_grpo_partition():
     model = FakeMultiLoraModel()
     rollout = EchoRollout()
     received = []
-    pipeline = BaseRLPipeline(
+    pipeline = FakeGRPOPipeline(
         config=BaseRLPipelineConfig(
             tenant_id='tenant',
             training_run_id='run',
@@ -85,7 +128,7 @@ def test_base_pipeline_runs_one_multilora_grpo_partition():
 def test_base_pipeline_uses_latest_adapter_revision_for_next_rollout():
     model = FakeMultiLoraModel()
     rollout = EchoRollout()
-    pipeline = BaseRLPipeline(
+    pipeline = FakeGRPOPipeline(
         config=BaseRLPipelineConfig(
             tenant_id='tenant',
             training_run_id='run',
@@ -106,3 +149,158 @@ def test_base_pipeline_uses_latest_adapter_revision_for_next_rollout():
     assert rollout.calls[0]['adapter_name'] == 'lora_a'
     assert 'adapter_path' not in rollout.calls[0]
     assert rollout.calls[1]['adapter_path'] == '/tmp/lora_a-v1'
+
+
+def test_base_pipeline_runs_two_lora_contexts_in_one_pipeline():
+    context_a = TrainingContext(
+        tenant_id='tenant_a',
+        training_run_id='run_a',
+        base_model_id='base',
+        adapter_name='lora_a',
+        reward_type='constant',
+        loss_type='grpo',
+    )
+    context_b = TrainingContext(
+        tenant_id='tenant_b',
+        training_run_id='run_b',
+        base_model_id='base',
+        adapter_name='lora_b',
+        reward_type='constant',
+        loss_type='grpo',
+    )
+    model = FakeMultiLoraModel()
+    rollout = EchoRollout()
+    received = []
+    pipeline = FakeGRPOPipeline(
+        config=BaseRLPipelineConfig(
+            training_contexts=[context_a, context_b],
+            reward_type='constant',
+            target_groups_per_partition=1,
+            max_train_partitions=2,
+        ),
+        model=model,
+        rollout=rollout,
+        reward_registry={'constant': lambda trajectories, **_: [1.0 for _ in trajectories]},
+        data_plane=TransferQueueDataPlane(tq_client=FakeTransferQueueClient()),
+        receive_weights_fn=lambda context: received.append(context),
+    )
+
+    pipeline.submit_rollout_samples([make_sample(0)], context=context_a)
+    pipeline.submit_rollout_samples([make_sample(1)], context=context_b)
+    history = pipeline.run_until_idle(max_steps=2)
+
+    trained = [step['train'] for step in history if step['train'] is not None]
+    assert len(trained) == 2
+    assert {call['adapter_name'] for call in model.forward_backward_calls} == {'lora_a', 'lora_b'}
+    assert {call['adapter_name'] for call in model.step_calls} == {'lora_a', 'lora_b'}
+    assert {call['adapter_name'] for call in model.save_calls} == {'lora_a', 'lora_b'}
+    assert {context.adapter_name for context in received} == {'lora_a', 'lora_b'}
+    assert all(partition.status == PartitionStatus.CLEARED for partition in pipeline.data_plane.list_partitions(context_a))
+    assert all(partition.status == PartitionStatus.CLEARED for partition in pipeline.data_plane.list_partitions(context_b))
+
+
+def test_base_pipeline_feeds_prompts_from_prompt_feeders():
+    context_a = TrainingContext(
+        tenant_id='tenant_a',
+        training_run_id='run_a',
+        base_model_id='base',
+        adapter_name='lora_a',
+        reward_type='constant',
+        loss_type='grpo',
+    )
+    context_b = TrainingContext(
+        tenant_id='tenant_b',
+        training_run_id='run_b',
+        base_model_id='base',
+        adapter_name='lora_b',
+        reward_type='constant',
+        loss_type='grpo',
+    )
+    model = FakeMultiLoraModel()
+    rollout = EchoRollout()
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+
+    class FeederPipeline(FakeGRPOPipeline):
+
+        def build_prompt_feeders(self):
+            return [
+                PromptFeeder(context=context_a, dataloader=[[make_sample(0)]], rollouter=self.rollouter),
+                PromptFeeder(context=context_b, dataloader=[[make_sample(1)]], rollouter=self.rollouter),
+            ]
+
+    pipeline = FeederPipeline(
+        config=BaseRLPipelineConfig(
+            training_contexts=[context_a, context_b],
+            reward_type='constant',
+            target_groups_per_partition=1,
+            max_train_partitions=2,
+        ),
+        model=model,
+        rollout=rollout,
+        reward_registry={'constant': lambda trajectories, **_: [1.0 for _ in trajectories]},
+        data_plane=data_plane,
+    )
+
+    history = pipeline.run_until_idle(max_steps=2)
+
+    trained = [step['train'] for step in history if step['train'] is not None]
+    assert len(trained) == 2
+    assert {call['adapter_name'] for call in model.forward_backward_calls} == {'lora_a', 'lora_b'}
+    assert all(feeder.exhausted for feeder in pipeline.prompt_feeders)
+
+
+def test_algorithm_pipeline_can_define_roles_directly():
+
+    class DummyComponent:
+
+        def __init__(self):
+            self.calls = 0
+
+        def step(self):
+            if self.calls > 0:
+                return None
+            self.calls += 1
+            return ComponentResult(component='dummy', kind='dummy', count=1)
+
+        def is_idle(self):
+            return self.calls > 0
+
+        def shutdown(self):
+            return None
+
+    class DummyAlgorithmPipeline(BaseRLPipeline):
+
+        def __init__(self, *args, component, data_plane, **kwargs):
+            self._dummy_component = component
+            self._dummy_data_plane = data_plane
+            super().__init__(*args, **kwargs)
+
+        def build_model(self):
+            return object()
+
+        def build_data_plane(self):
+            return self._dummy_data_plane
+
+        def create_roles(self):
+            assert self.config.algorithm == 'dummy'
+            self.components = [self._dummy_component]
+
+    component = DummyComponent()
+    pipeline = DummyAlgorithmPipeline(
+        config=BaseRLPipelineConfig(
+            tenant_id='tenant',
+            training_run_id='run',
+            base_model_id='base',
+            adapter_name='lora_a',
+            algorithm='dummy',
+            max_train_partitions=1,
+        ),
+        data_plane=TransferQueueDataPlane(tq_client=FakeTransferQueueClient()),
+        component=component,
+    )
+
+    history = pipeline.run_until_idle(max_steps=1)
+
+    assert component.calls == 1
+    assert history
+    assert not hasattr(pipeline, 'rollouter')
