@@ -277,10 +277,77 @@ assert len(tq_data.get(partition.partition_id, {})) == 0
 
 ---
 
-## 7. 全量测试结果
+## 8. Metadata 阶段进度验证（真实 TQ）
+
+**问题**：需要验证 metadata 是否能正确反映 live partitions、最老 partition、各阶段完成进度。
+
+**修复**：新增 `test_metadata_stage_progress_with_real_tq` 测试，验证 metadata 在多阶段并行场景下的正确性。
+
+**Commit**: `8b8649d`
+
+### 验证场景
+
+```python
+# 创建 4 个 partition，分别处于不同阶段
+p1: ROLLOUT_DONE
+p2: REWARD_DONE
+p3: TRAIN_READY
+p4: TRAINING
+
+# 验证 metadata 正确反映各阶段状态
+qm = real_dp.get_metadata(ctx)
+assert qm.live_partition_count == 4
+assert qm.total_rows == 4
+assert qm.oldest_partition.partition_id == p1.partition_id
+
+# 统计各阶段 partition 数量
+partitions = list(qm)
+status_counts = {}
+for p in partitions:
+    status_counts[p.status] = status_counts.get(p.status, 0) + 1
+
+assert status_counts[PartitionStatus.ROLLOUT_DONE] == 1
+assert status_counts[PartitionStatus.REWARD_DONE] == 1
+assert status_counts[PartitionStatus.TRAIN_READY] == 1
+assert status_counts[PartitionStatus.TRAINING] == 1
+
+# p4 完成训练，验证状态变化
+real_dp.mark_trained(ctx, p4.partition_id)
+qm = real_dp.get_metadata(ctx)
+status_counts = count_statuses(qm)
+assert status_counts.get(PartitionStatus.TRAINING, 0) == 0
+assert status_counts[PartitionStatus.TRAIN_DONE] == 1
+
+# 清除 p4，验证 live count 减少
+real_dp.clear_partition(ctx, p4.partition_id)
+qm = real_dp.get_metadata(ctx)
+assert qm.live_partition_count == 3
+assert qm.total_rows == 3  # p4 数据已删除
+
+# 验证 oldest 仍然是 p1
+assert qm.oldest_partition.partition_id == p1.partition_id
+
+# 清除 p1，验证 oldest 变为 p2
+real_dp.clear_partition(ctx, p1.partition_id)
+qm = real_dp.get_metadata(ctx)
+assert qm.live_partition_count == 2
+assert qm.oldest_partition.partition_id == p2.partition_id
+```
+
+### 验证结果
+
+✅ **Metadata 正确反映各阶段进度**
+- live_partition_count：正确统计活跃 partition 数量
+- total_rows：正确统计总行数，清除后自动减少
+- oldest_partition：正确识别最老 partition，清除后自动更新
+- 各阶段状态计数：正确统计 ROLLOUT_DONE、REWARD_DONE、TRAIN_READY、TRAINING、TRAIN_DONE 各阶段数量
+
+---
+
+## 9. 全量测试结果
 
 ```
-======================= 155 passed, 1 skipped in 67.01s ========================
+======================= 156 passed, 1 skipped in 67.83s ========================
 ```
 
 | 测试文件 | 测试数 | 状态 |
@@ -291,12 +358,12 @@ assert len(tq_data.get(partition.partition_id, {})) == 0
 | test_data_plane_new_features.py | 28 | ✅ |
 | test_developer_a_acceptance.py | 42 | ✅ |
 | test_e2e_gsm8k.py | 5 | ✅ |
-| test_real_tq.py | 21 | ✅ |
+| test_real_tq.py | 22 | ✅ |
 | **总计** | **134** | **134 passed, 1 skipped** |
 
 ---
 
-## 7. Commit 记录
+## 10. Commit 记录
 
 | Commit | 说明 |
 |--------|------|
@@ -305,3 +372,5 @@ assert len(tq_data.get(partition.partition_id, {})) == 0
 | `8d83f86` | feat: add build_streaming_dataset() wrapping TQ native streaming |
 | `4519b0c` | fix: add context.key validation to append_rewards and append_advantages |
 | `1f2cc9d` | test: add field state flow verification with real TQ |
+| `837fa66` | docs: update daily log with field state flow verification |
+| `8b8649d` | test: add metadata stage progress verification with real TQ |
