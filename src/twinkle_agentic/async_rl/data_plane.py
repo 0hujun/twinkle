@@ -2,25 +2,77 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
-from .types import PartitionMetadata, PartitionStatus, SampleRecord, TrainingContext
+from .types import PartitionMetadata, PartitionStatus, QueueMetadata, SampleRecord, TrainingContext
 
 
 @dataclass
 class TransferQueueRuntimeConfig:
-    """TransferQueue initialization and lightweight capacity guard config."""
+    """TransferQueue initialization and capacity guard config.
+    Capacity auto-calculation:
+      samples_per_partition = target_groups * num_generations
+      max_live_partitions = max_staleness + 1
+      max_rows = samples_per_partition * max_live_partitions
+      max_tq_bytes = estimate_bytes_per_sample * max_rows * safety_factor
+    """
 
+    # TQ backend
     total_storage_size: Optional[int] = None
-    max_rows: Optional[int] = None
-    max_rows_per_context: Optional[int] = None
     num_data_storage_units: int = 4
     storage_backend: str = 'SimpleStorage'
     controller: Dict[str, Any] = field(default_factory=dict)
     backend: Dict[str, Any] = field(default_factory=dict)
     init: bool = True
+
+    # Capacity planning inputs
+    target_groups: int = 128
+    num_generations: int = 8
+    max_staleness: int = 1
+    estimate_bytes_per_sample: Optional[int] = None
+    safety_factor: float = 1.2
+
+    # Capacity guard thresholds (None = auto-calculate)
+    max_rows: Optional[int] = None
+    max_rows_per_context: Optional[int] = None
+    max_tq_bytes: Optional[int] = None
+    max_live_partitions_per_context: Optional[int] = None
+
+    # Runtime
+    lease_timeout: float = 300.0
+
+    def compute_max_rows(self) -> int:
+        """Auto-calculate max_rows from capacity planning inputs."""
+        samples_per_partition = self.target_groups * self.num_generations
+        max_live = self.max_staleness + 1
+        return samples_per_partition * max_live
+
+    def compute_max_live_partitions(self) -> int:
+        return self.max_staleness + 1
+
+    def compute_max_tq_bytes(self) -> Optional[int]:
+        if self.estimate_bytes_per_sample is None:
+            return None
+        return int(self.estimate_bytes_per_sample * self.compute_max_rows() * self.safety_factor)
+
+    def resolve_max_rows(self) -> int:
+        """Return explicit max_rows or auto-calculated value."""
+        if self.max_rows is not None:
+            return self.max_rows
+        return self.compute_max_rows()
+
+    def resolve_max_rows_per_context(self) -> int:
+        if self.max_rows_per_context is not None:
+            return self.max_rows_per_context
+        return self.resolve_max_rows()
+
+    def resolve_max_live_partitions_per_context(self) -> int:
+        if self.max_live_partitions_per_context is not None:
+            return self.max_live_partitions_per_context
+        return self.compute_max_live_partitions()
 
 
 class TransferQueueDataPlane:
@@ -31,6 +83,9 @@ class TransferQueueDataPlane:
         self.tq = tq_client or self._init_transfer_queue(self.tq_config)
         self._meta: Dict[str, PartitionMetadata] = {}
         self._next_train_id: Dict[str, int] = defaultdict(int)
+        self._consumed: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
+        self._leases: Dict[str, Dict[str, Any]] = {}
+        self._trainer_steps: Dict[str, int] = defaultdict(int)
         self._lock = threading.RLock()
 
     def _init_transfer_queue(self, config: TransferQueueRuntimeConfig):
@@ -54,14 +109,23 @@ class TransferQueueDataPlane:
         backend_config = dict(config.backend)
         simple_storage = dict(backend_config.get('SimpleStorage') or {})
         simple_storage.setdefault('num_data_storage_units', config.num_data_storage_units)
+        resolved_max_rows = config.resolve_max_rows()
         if config.total_storage_size is not None:
             simple_storage.setdefault('total_storage_size', config.total_storage_size)
+        elif config.estimate_bytes_per_sample is not None:
+            max_bytes = config.compute_max_tq_bytes()
+            if max_bytes is not None:
+                simple_storage.setdefault('total_storage_size', max_bytes)
         backend_config.setdefault('storage_backend', config.storage_backend)
         backend_config['SimpleStorage'] = simple_storage
         return OmegaConf.create(
             {'controller': config.controller, 'backend': backend_config},
             flags={'allow_objects': True},
         )
+
+    def close(self) -> None:
+        if hasattr(self.tq, 'close'):
+            self.tq.close()
 
     def init_namespace(self, context: TrainingContext) -> None:
         context.metadata()
@@ -115,18 +179,23 @@ class TransferQueueDataPlane:
             if meta.status != PartitionStatus.OPEN:
                 raise ValueError(f'partition {partition_id} is not open for rollout append: {meta.status}')
             keys = []
+            all_fields = []
+            all_tags = []
             for idx, trajectory in enumerate(trajectories):
                 sample = dict(trajectory)
                 sample_meta = dict(sample.get('metadata') or {})
                 sample_meta.update(context.metadata())
                 sample_meta.setdefault('partition_id', partition_id)
-                context.validate_metadata(sample_meta)
+                context.validate_metadata(sample_meta, strict_policy_version=False)
                 key = sample.get('sample_id') or f'{partition_id}/sample_{meta.num_rows + idx}'
                 fields = {k: v for k, v in sample.items() if k not in {'metadata', 'sample_id'}}
                 tag = dict(sample_meta)
                 tag.update(meta.tag())
-                self.tq.kv_put(key=key, partition_id=partition_id, fields=fields, tag=tag)
                 keys.append(key)
+                all_fields.append(fields)
+                all_tags.append(tag)
+            if keys:
+                self._kv_batch_put(keys, partition_id, all_fields, all_tags)
             meta.num_rows += len(keys)
             meta.ready_groups += ready_groups
             if seal or (meta.target_groups and meta.ready_groups >= meta.target_groups):
@@ -152,21 +221,87 @@ class TransferQueueDataPlane:
             partitions = [p for p in partitions if p.status in status_set]
         return sorted(partitions, key=lambda p: (p.created_at, p.partition_id))
 
-    def get_metadata(self, context: Optional[TrainingContext] = None) -> list[PartitionMetadata]:
-        return self.list_partitions(context)
+    def get_metadata(self, context: Optional[TrainingContext] = None) -> QueueMetadata | list[PartitionMetadata]:
+        """Return QueueMetadata if context is specified, else list of all partitions.
+
+        When called with a context, returns a QueueMetadata object containing
+        aggregate information for that scope.
+        When called without context, returns the raw partition list for backward compat.
+        """
+        partitions = self.list_partitions(context)
+        if context is not None:
+            active = [p for p in partitions if p.status not in (PartitionStatus.CLEARED, PartitionStatus.CANCELLED)]
+            total_rows = sum(p.num_rows for p in active)
+            return QueueMetadata(
+                context=context,
+                active_partitions=active,
+                total_rows=total_rows,
+                trainer_step=self._trainer_steps.get(context.key, 0),
+                current_policy_version=context.policy_version,
+            )
+        return partitions
 
     def check_capacity(self, context: TrainingContext) -> bool:
         live_partitions = [p for p in self.list_partitions() if p.status != PartitionStatus.CLEARED]
         total_rows = sum(p.num_rows for p in live_partitions)
         context_rows = sum(p.num_rows for p in live_partitions if p.context.key == context.key)
-        if self.tq_config.max_rows is not None and total_rows >= self.tq_config.max_rows:
+        max_rows = self.tq_config.resolve_max_rows()
+        max_rows_per_ctx = self.tq_config.resolve_max_rows_per_context()
+        if total_rows >= max_rows:
             return False
-        if self.tq_config.max_rows_per_context is not None and context_rows >= self.tq_config.max_rows_per_context:
+        if context_rows >= max_rows_per_ctx:
+            return False
+        max_live = self.tq_config.resolve_max_live_partitions_per_context()
+        context_live = len([p for p in live_partitions if p.context.key == context.key])
+        if context_live >= max_live:
             return False
         return True
 
-    def claim_reward_batch(self, context: TrainingContext, batch_size: int) -> tuple[PartitionMetadata, list[SampleRecord]]:
-        return self._claim_samples(context, batch_size, [PartitionStatus.ROLLOUT_DONE], 'reward')
+    def claim_reward_batch(
+        self,
+        context: TrainingContext,
+        batch_size: int,
+        *,
+        worker_id: Optional[str] = None,
+    ) -> tuple[PartitionMetadata, list[SampleRecord]]:
+        return self._claim_samples(context, batch_size, [PartitionStatus.ROLLOUT_DONE], 'reward', worker_id=worker_id)
+
+    def claim_reward_ready_groups(
+        self,
+        context: TrainingContext,
+        num_generations: int,
+        max_groups: int,
+        *,
+        worker_id: Optional[str] = None,
+    ) -> tuple[PartitionMetadata, list[list[SampleRecord]]]:
+        """Claim reward-ready data at the group level.
+
+        Finds the first ROLLOUT_DONE partition for the given context, groups
+        samples by group_id, and returns up to max_groups complete groups.
+        Each group contains exactly num_generations samples.
+
+        Returns:
+            (PartitionMetadata, list of groups) where each group is a
+            list[SampleRecord] of num_generations trajectories.
+        """
+        partitions = self.list_partitions(context, statuses=[PartitionStatus.ROLLOUT_DONE])
+        if not partitions:
+            raise LookupError(f'no reward-ready partition for {context.key}')
+        meta = partitions[0]
+        if worker_id is not None:
+            self.claim_partition_with_lease(context, meta.partition_id, worker_id=worker_id)
+        samples = self._get_samples(meta.partition_id)
+        groups: Dict[str, list[SampleRecord]] = defaultdict(list)
+        for sample in samples:
+            gid = sample.get('group_id', sample['sample_id'])
+            groups[gid].append(sample)
+        result_groups = []
+        for gid, group_samples in groups.items():
+            if len(group_samples) >= num_generations:
+                result_groups.append(group_samples[:num_generations])
+            if len(result_groups) >= max_groups:
+                break
+        return meta, result_groups
 
     def append_rewards(
         self,
@@ -183,15 +318,23 @@ class TransferQueueDataPlane:
         for sample, reward in zip(samples, rewards):
             context.validate_metadata(sample.get('metadata') or {}, strict_policy_version=False)
             updates[sample['sample_id']] = {field_name: reward}
-        self._update_samples(partition_id, updates)
+        self._batch_update_samples(partition_id, updates)
         meta = self._meta[partition_id]
         meta.status = PartitionStatus.REWARD_DONE
         meta.touch()
         self._sync_partition_status(meta)
         return meta
 
-    def claim_advantage_batch(self, context: TrainingContext, batch_size: int) -> tuple[PartitionMetadata, list[SampleRecord]]:
-        return self._claim_samples(context, batch_size, [PartitionStatus.REWARD_DONE], 'advantage')
+    def claim_advantage_batch(
+        self,
+        context: TrainingContext,
+        batch_size: int,
+        *,
+        worker_id: Optional[str] = None,
+    ) -> tuple[PartitionMetadata, list[SampleRecord]]:
+        return self._claim_samples(
+            context, batch_size, [PartitionStatus.REWARD_DONE], 'advantage', worker_id=worker_id,
+        )
 
     def append_advantages(
         self,
@@ -209,7 +352,7 @@ class TransferQueueDataPlane:
         for sample, advantage, ret in zip(samples, advantages, returns):
             context.validate_metadata(sample.get('metadata') or {}, strict_policy_version=False)
             updates[sample['sample_id']] = {'advantages': advantage, 'returns': ret}
-        self._update_samples(partition_id, updates)
+        self._batch_update_samples(partition_id, updates)
         meta = self._meta[partition_id]
         meta.status = PartitionStatus.TRAIN_READY
         meta.touch()
@@ -223,13 +366,119 @@ class TransferQueueDataPlane:
         return self._mark_status(context, partition_id, PartitionStatus.TRAINING)
 
     def mark_trained(self, context: TrainingContext, partition_id: str) -> PartitionMetadata:
+        with self._lock:
+            self._trainer_steps[context.key] = self._trainer_steps.get(context.key, 0) + 1
         return self._mark_status(context, partition_id, PartitionStatus.TRAIN_DONE)
 
-    def build_streaming_dataloader(self, context: TrainingContext, partition_id: str):
+    def build_streaming_dataloader(
+        self,
+        context: TrainingContext,
+        partition_id: str,
+        *,
+        task_name: Optional[str] = None,
+        required_fields: Optional[frozenset] = None,
+    ) -> list[SampleRecord]:
         meta = self._meta[partition_id]
         if meta.context.key != context.key:
             raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
-        return self._get_samples(partition_id)
+        samples = self._get_samples(partition_id)
+        if task_name is not None:
+            consumed = self._consumed[partition_id].get(task_name, set())
+            samples = [s for s in samples if s['sample_id'] not in consumed]
+        if required_fields is not None:
+            incomplete = []
+            for s in samples:
+                missing = required_fields - set(s.keys())
+                if missing:
+                    incomplete.append((s['sample_id'], missing))
+            if incomplete:
+                raise ValueError(
+                    f'{len(incomplete)} samples missing required fields: '
+                    f'{incomplete[0][0]} missing {incomplete[0][1]}'
+                )
+        return samples
+
+    def ack_rows(
+        self,
+        context: TrainingContext,
+        partition_id: str,
+        sample_ids: List[str],
+        *,
+        task_name: str = 'train',
+    ) -> int:
+        meta = self._meta.get(partition_id)
+        if meta is not None and meta.context.key != context.key:
+            raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
+        with self._lock:
+            consumed = self._consumed[partition_id][task_name]
+            before = len(consumed)
+            consumed.update(sample_ids)
+            return len(consumed) - before
+
+    def get_consumed_count(self, partition_id: str, *, task_name: str = 'train') -> int:
+        return len(self._consumed[partition_id].get(task_name, set()))
+
+    def claim_partition_with_lease(
+        self,
+        context: TrainingContext,
+        partition_id: str,
+        *,
+        worker_id: str,
+        timeout: Optional[float] = None,
+    ) -> PartitionMetadata:
+        lease_timeout = timeout if timeout is not None else self.tq_config.lease_timeout
+        with self._lock:
+            self._recover_expired_leases()
+            existing = self._leases.get(partition_id)
+            if existing is not None:
+                if existing['worker_id'] != worker_id:
+                    raise RuntimeError(
+                        f'partition {partition_id} is leased by {existing["worker_id"]} '
+                        f'until {existing["deadline"]}'
+                    )
+            meta = self._meta.get(partition_id)
+            if meta is not None and meta.context.key != context.key:
+                raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
+            self._leases[partition_id] = {
+                'worker_id': worker_id,
+                'deadline': time.time() + lease_timeout,
+                'context_key': context.key,
+            }
+            if meta is not None:
+                meta.owner_worker_id = worker_id
+                meta.lease_deadline = self._leases[partition_id]['deadline']
+                meta.touch()
+            return meta
+
+    def release_lease(self, partition_id: str, *, worker_id: str) -> None:
+        with self._lock:
+            existing = self._leases.get(partition_id)
+            if existing is None:
+                return
+            if existing['worker_id'] != worker_id:
+                raise RuntimeError(
+                    f'partition {partition_id} is leased by {existing["worker_id"]}, not {worker_id}'
+                )
+            del self._leases[partition_id]
+            meta = self._meta.get(partition_id)
+            if meta is not None:
+                meta.owner_worker_id = None
+                meta.lease_deadline = None
+
+    def renew_lease(self, partition_id: str, *, worker_id: str, timeout: Optional[float] = None) -> None:
+        lease_timeout = timeout if timeout is not None else self.tq_config.lease_timeout
+        with self._lock:
+            existing = self._leases.get(partition_id)
+            if existing is None:
+                raise RuntimeError(f'no active lease on partition {partition_id}')
+            if existing['worker_id'] != worker_id:
+                raise RuntimeError(
+                    f'partition {partition_id} is leased by {existing["worker_id"]}, not {worker_id}'
+                )
+            existing['deadline'] = time.time() + lease_timeout
+            meta = self._meta.get(partition_id)
+            if meta is not None:
+                meta.lease_deadline = existing['deadline']
 
     def clear_partition(self, context: TrainingContext, partition_id: str) -> None:
         meta = self._meta.get(partition_id)
@@ -241,6 +490,18 @@ class TransferQueueDataPlane:
         if meta is not None:
             meta.status = PartitionStatus.CLEARED
             meta.touch()
+        with self._lock:
+            self._consumed.pop(partition_id, None)
+            self._leases.pop(partition_id, None)
+
+    def clear_namespace(self, context: TrainingContext) -> int:
+        partitions = self.list_partitions(context)
+        cleared = 0
+        for partition in partitions:
+            if partition.status != PartitionStatus.CLEARED:
+                self.clear_partition(context, partition.partition_id)
+                cleared += 1
+        return cleared
 
     def _claim_samples(
         self,
@@ -248,11 +509,15 @@ class TransferQueueDataPlane:
         batch_size: int,
         statuses: Iterable[PartitionStatus],
         task_name: str,
+        *,
+        worker_id: Optional[str] = None,
     ) -> tuple[PartitionMetadata, list[SampleRecord]]:
         partitions = self.list_partitions(context, statuses=statuses)
         if not partitions:
             raise LookupError(f'no {task_name}-ready partition for {context.key}')
         meta = partitions[0]
+        if worker_id is not None:
+            self.claim_partition_with_lease(context, meta.partition_id, worker_id=worker_id)
         return meta, self._get_samples(meta.partition_id)[:batch_size]
 
     def _mark_status(self, context: TrainingContext, partition_id: str, status: PartitionStatus) -> PartitionMetadata:
@@ -279,22 +544,51 @@ class TransferQueueDataPlane:
             samples.append(copied)
         return samples
 
-    def _update_samples(self, partition_id: str, updates: Dict[str, Dict[str, Any]]) -> None:
+    def _batch_update_samples(self, partition_id: str, updates: Dict[str, Dict[str, Any]]) -> None:
         tags_by_key = self.tq.kv_list(partition_id=partition_id).get(partition_id, {})
-        for key, fields in updates.items():
-            self.tq.kv_put(
-                key=key,
-                partition_id=partition_id,
-                fields=fields,
-                tag=dict(tags_by_key.get(key) or {}),
-            )
+        keys = list(updates.keys())
+        all_fields = [updates[key] for key in keys]
+        all_tags = [dict(tags_by_key.get(key) or {}) for key in keys]
+        if keys:
+            self._kv_batch_put(keys, partition_id, all_fields, all_tags)
 
     def _sync_partition_status(self, meta: PartitionMetadata) -> None:
         tags_by_key = self.tq.kv_list(partition_id=meta.partition_id).get(meta.partition_id, {})
-        for key, tag in tags_by_key.items():
-            updated = dict(tag)
+        keys = list(tags_by_key.keys())
+        if not keys:
+            return
+        all_tags = []
+        for key in keys:
+            updated = dict(tags_by_key[key])
             updated.update(meta.tag())
-            self.tq.kv_put(key=key, partition_id=meta.partition_id, tag=updated)
+            all_tags.append(updated)
+        self._kv_batch_put(keys, meta.partition_id, [None] * len(keys), all_tags)
+
+    def _kv_batch_put(
+        self,
+        keys: List[str],
+        partition_id: str,
+        fields_list: List[Optional[Dict[str, Any]]],
+        tags_list: List[Dict[str, Any]],
+    ) -> None:
+        if hasattr(self.tq, 'kv_batch_put'):
+            self.tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=None, tags=tags_list)
+            for key, fields in zip(keys, fields_list):
+                if fields is not None:
+                    self.tq.kv_put(key=key, partition_id=partition_id, fields=fields)
+        else:
+            for key, fields, tag in zip(keys, fields_list, tags_list):
+                self.tq.kv_put(key=key, partition_id=partition_id, fields=fields, tag=tag)
+
+    def _recover_expired_leases(self) -> None:
+        now = time.time()
+        expired = [pid for pid, lease in self._leases.items() if lease['deadline'] <= now]
+        for pid in expired:
+            del self._leases[pid]
+            meta = self._meta.get(pid)
+            if meta is not None:
+                meta.owner_worker_id = None
+                meta.lease_deadline = None
 
     def _load_partition_meta(self) -> None:
         for partition_id, tags_by_key in self.tq.kv_list().items():
