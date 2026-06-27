@@ -5,7 +5,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 from .types import PartitionMetadata, PartitionStatus, QueueMetadata, SampleRecord, TrainingContext
 
@@ -370,6 +370,45 @@ class TransferQueueDataPlane:
             self._trainer_steps[context.key] = self._trainer_steps.get(context.key, 0) + 1
         return self._mark_status(context, partition_id, PartitionStatus.TRAIN_DONE)
 
+    def build_streaming_dataset(
+        self,
+        context: TrainingContext,
+        partition_id: str,
+        *,
+        batch_size: int = 32,
+        data_fields: Optional[List[str]] = None,
+        task_name: str = 'train',
+        dp_rank: int = 0,
+    ) -> '_StreamingDatasetWrapper':
+        """Build a streaming dataset that wraps TQ Client API for batch iteration.
+
+        Uses TQ Client API (get_meta + get_data) to stream batches from the partition.
+        Each iteration yields a list[SampleRecord] batch and auto-acks consumed samples.
+
+        Args:
+            context: Training context for partition ownership validation
+            partition_id: Partition to stream from
+            batch_size: Number of samples per batch
+            data_fields: Fields to retrieve (None = all fields)
+            task_name: Task name for consumption tracking
+            dp_rank: Data parallel rank for distributed training
+
+        Returns:
+            _StreamingDatasetWrapper that yields list[SampleRecord] batches
+        """
+        meta = self._meta[partition_id]
+        if meta.context.key != context.key:
+            raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
+        return _StreamingDatasetWrapper(
+            data_plane=self,
+            context=context,
+            partition_id=partition_id,
+            batch_size=batch_size,
+            data_fields=data_fields,
+            task_name=task_name,
+            dp_rank=dp_rank,
+        )
+
     def build_streaming_dataloader(
         self,
         context: TrainingContext,
@@ -655,3 +694,93 @@ class TransferQueueDataPlane:
             )
         except (KeyError, ValueError):
             return None
+
+
+class _StreamingDatasetWrapper:
+    """Wrapper around TQ Client API for streaming batch iteration.
+
+    Uses TQ Client API (get_meta + get_data) to stream batches from a partition.
+    Each iteration yields a list[SampleRecord] batch and auto-acks consumed samples
+    via the DataPlane's ack_rows method.
+
+    This wraps TQ's native streaming capabilities and provides:
+    - Automatic conversion from TensorDict to SampleRecord (dict)
+    - Automatic ack tracking via DataPlane.ack_rows()
+    - Simple iterator interface yielding list[SampleRecord] batches
+    """
+
+    def __init__(
+        self,
+        data_plane: TransferQueueDataPlane,
+        context: TrainingContext,
+        partition_id: str,
+        batch_size: int,
+        data_fields: Optional[List[str]],
+        task_name: str,
+        dp_rank: int,
+    ):
+        self._data_plane = data_plane
+        self._context = context
+        self._partition_id = partition_id
+        self._batch_size = batch_size
+        self._data_fields = data_fields
+        self._task_name = task_name
+        self._dp_rank = dp_rank
+        self._client = data_plane.tq.get_client() if hasattr(data_plane.tq, 'get_client') else None
+        self._total_acked = 0
+
+    def __iter__(self) -> Iterator[list[SampleRecord]]:
+        """Iterate over batches, yielding list[SampleRecord] and auto-acking."""
+        if self._client is None:
+            yield from self._iter_via_kv_api()
+        else:
+            yield from self._iter_via_client_api()
+
+    def _iter_via_client_api(self) -> Iterator[list[SampleRecord]]:
+        """Stream using TQ Client API (get_meta + get_data)."""
+        fields = self._data_fields or ['messages', 'group_id', 'generation_idx', 'old_logps',
+                                        'rewards', 'advantages', 'returns']
+        while True:
+            try:
+                batch_meta = self._client.get_meta(
+                    data_fields=fields,
+                    batch_size=self._batch_size,
+                    partition_id=self._partition_id,
+                    mode='fetch',
+                    task_name=self._task_name,
+                    sampling_config={'dp_rank': self._dp_rank},
+                )
+            except Exception:
+                break
+            if batch_meta is None or batch_meta.size == 0:
+                break
+            data = self._client.get_data(batch_meta)
+            samples = self._data_plane._rows_from_tq_data(data, batch_meta.size)
+            keys = self._client.kv_retrieve_keys(
+                global_indexes=batch_meta.global_indexes,
+                partition_id=self._partition_id,
+            )
+            tags_by_key = self._data_plane.tq.kv_list(partition_id=self._partition_id).get(self._partition_id, {})
+            for i, (key, sample) in enumerate(zip(keys, samples)):
+                sample['sample_id'] = key if isinstance(key, str) else str(key)
+                sample['metadata'] = dict(tags_by_key.get(key, {}))
+            sample_ids = [s['sample_id'] for s in samples]
+            self._data_plane.ack_rows(self._context, self._partition_id, sample_ids, task_name=self._task_name)
+            self._total_acked += len(samples)
+            yield samples
+
+    def _iter_via_kv_api(self) -> Iterator[list[SampleRecord]]:
+        """Fallback: stream using KV API when Client API is unavailable."""
+        all_samples = self._data_plane._get_samples(self._partition_id)
+        consumed = self._data_plane._consumed[self._partition_id].get(self._task_name, set())
+        remaining = [s for s in all_samples if s['sample_id'] not in consumed]
+        for i in range(0, len(remaining), self._batch_size):
+            batch = remaining[i:i + self._batch_size]
+            sample_ids = [s['sample_id'] for s in batch]
+            self._data_plane.ack_rows(self._context, self._partition_id, sample_ids, task_name=self._task_name)
+            self._total_acked += len(batch)
+            yield batch
+
+    @property
+    def total_acked(self) -> int:
+        return self._total_acked

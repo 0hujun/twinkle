@@ -336,6 +336,52 @@ class TestClearNamespace:
         assert cleared == 0
 
 
+class TestStreamingDataset:
+    """Tests for build_streaming_dataset() method."""
+
+    def test_streaming_dataset_yields_batches(self):
+        dp = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+        ctx = make_context()
+        p = dp.create_partition(ctx, target_groups=1)
+        samples = [make_sample(i) for i in range(10)]
+        dp.put_rollout_batch(ctx, p.partition_id, samples, seal=True)
+        dp.append_rewards(ctx, p.partition_id, [1.0] * 10)
+        dp.append_advantages(ctx, p.partition_id, [0.5] * 10)
+
+        dataset = dp.build_streaming_dataset(ctx, p.partition_id, batch_size=3, task_name='train')
+        batches = list(dataset)
+        assert len(batches) == 4
+        assert len(batches[0]) == 3
+        assert len(batches[1]) == 3
+        assert len(batches[2]) == 3
+        assert len(batches[3]) == 1
+        assert dataset.total_acked == 10
+
+    def test_streaming_dataset_auto_acks(self):
+        dp = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+        ctx = make_context()
+        p = dp.create_partition(ctx, target_groups=1)
+        samples = [make_sample(i) for i in range(5)]
+        dp.put_rollout_batch(ctx, p.partition_id, samples, seal=True)
+        dp.append_rewards(ctx, p.partition_id, [1.0] * 5)
+        dp.append_advantages(ctx, p.partition_id, [0.5] * 5)
+
+        dataset = dp.build_streaming_dataset(ctx, p.partition_id, batch_size=2, task_name='train')
+        batch1 = next(iter(dataset))
+        assert len(batch1) == 2
+        assert dp.get_consumed_count(p.partition_id, task_name='train') == 2
+
+    def test_streaming_dataset_rejects_cross_context(self):
+        dp = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+        ctx = make_context()
+        other = make_context('other')
+        p = dp.create_partition(ctx, target_groups=1)
+        dp.put_rollout_batch(ctx, p.partition_id, [make_sample(0)], seal=True)
+
+        with pytest.raises(ValueError, match='belongs to'):
+            dp.build_streaming_dataset(other, p.partition_id, batch_size=1)
+
+
 class TestClose:
 
     def test_close_calls_tq_close(self):

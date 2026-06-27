@@ -68,6 +68,28 @@ def compute_gsm8k_rewards(trajectories: List[Dict[str, Any]], **kwargs) -> List[
 
 
 def main():
+    import twinkle
+    from twinkle import DeviceMesh, DeviceGroup, get_logger
+    from twinkle.model.transformers.multi_lora_transformers import MultiLoraTransformersModel
+    from twinkle.processor import InputProcessor
+    from twinkle.sampler import vLLMSampler
+    from twinkle.checkpoint_engine import CheckpointEngineManager
+    from twinkle_agentic.rollout import MultiTurnRollout
+
+    logger = get_logger()
+
+    MODEL_GPUS = 4
+    SAMPLER_GPUS = 4
+    NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
+
+    device_groups = [
+        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='NPU'),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='NPU'),
+    ]
+    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
+    twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups, lazy_collect=False)
+
     lora_config = LoraConfig(
         target_modules=[
             'q_proj', 'k_proj', 'v_proj', 'o_proj',
@@ -78,31 +100,41 @@ def main():
         lora_dropout=0.05,
     )
 
-    from twinkle.sampler import vLLMSampler
-    from twinkle_agentic.rollout import MultiTurnRollout
+    logger.info(f'Loading model from {MODEL_ID}...')
+    model = MultiLoraTransformersModel(
+        model_id=MODEL_ID,
+        device_mesh=model_mesh,
+        remote_group='model',
+        mixed_precision='bf16',
+    )
+    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
+    model.set_optimizer('AdamW', lr=LEARNING_RATE)
+    model.set_loss('GRPOLoss', epsilon=0.2)
+    model.set_processor(InputProcessor)
+    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
+
+    logger.info('Initializing vLLM sampler...')
+    sampler = vLLMSampler(
+        model_id=MODEL_ID,
+        engine_args={
+            'gpu_memory_utilization': 0.8,
+            'max_model_len': 1536,
+            'max_lora_rank': 16,
+            'enable_lora': True,
+        },
+        device_mesh=sampler_mesh,
+        remote_group='sampler',
+    )
+    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
+
+    ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
 
     class GSM8KGRPOPipeline(BaseRLPipeline):
 
         def build_model(self):
-            return BaseRLPipeline.build_multilora_model(
-                model_id=MODEL_ID,
-                adapter_name=ADAPTER_NAME,
-                lora_config=lora_config,
-                learning_rate=LEARNING_RATE,
-                template_cls='Qwen3_5Template',
-            )
+            return model
 
         def build_rollout(self):
-            sampler = vLLMSampler(
-                model_id=MODEL_ID,
-                engine_args={
-                    'gpu_memory_utilization': 0.8,
-                    'max_model_len': 1536,
-                    'max_lora_rank': 16,
-                    'enable_lora': True,
-                },
-            )
-            sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
             return MultiTurnRollout(sampler=sampler, max_turns=1)
 
         def build_reward_registry(self):
