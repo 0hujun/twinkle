@@ -184,10 +184,103 @@ claim_reward_batch(ctx, batch_size, worker_id='rw2')  # 第二个 worker
 
 ---
 
-## 6. 全量测试结果
+## 6. 字段状态流转验证（真实 TQ）
+
+**问题**：需要验证通过 DataPlane 操作真实 TQ 时，字段在 `rollout -> reward -> advantage -> train -> clear` 各阶段的状态流转是否正确。
+
+**修复**：新增 `test_field_state_flow_with_real_tq` 测试，逐阶段验证字段状态。
+
+**Commit**: `1f2cc9d`
+
+### 验证场景
+
+```python
+# Stage 1: Rollout - 写入 messages, group_id, generation_idx, old_logps
+sample = {
+    'sample_id': 'sample_0',
+    'messages': [{'role': 'user', 'content': 'What is 2+2?'}],
+    'group_id': 'group_0',
+    'generation_idx': 0,
+    'old_logps': [0.1, 0.2, 0.3],
+}
+meta = real_dp.put_rollout_batch(ctx, partition.partition_id, [sample], seal=True)
+assert meta.status == PartitionStatus.ROLLOUT_DONE
+
+# 验证：只有 rollout 字段，没有 rewards/advantages/returns
+samples = real_dp.build_streaming_dataloader(ctx, partition.partition_id)
+assert 'messages' in samples[0]
+assert 'group_id' in samples[0]
+assert 'old_logps' in samples[0]
+assert 'rewards' not in samples[0]
+assert 'advantages' not in samples[0]
+assert 'returns' not in samples[0]
+
+# Stage 2: Reward - 追加 rewards 字段
+meta = real_dp.append_rewards(ctx, partition.partition_id, [1.5])
+assert meta.status == PartitionStatus.REWARD_DONE
+
+# 验证：rewards 字段已添加，值正确
+samples = real_dp.build_streaming_dataloader(ctx, partition.partition_id)
+assert 'rewards' in samples[0]
+assert samples[0]['rewards'] == 1.5
+assert 'advantages' not in samples[0]
+assert 'returns' not in samples[0]
+
+# Stage 3: Advantage - 追加 advantages 和 returns 字段
+meta = real_dp.append_advantages(ctx, partition.partition_id, [0.8], returns=[1.2])
+assert meta.status == PartitionStatus.TRAIN_READY
+
+# 验证：advantages 和 returns 字段已添加，值正确
+samples = real_dp.build_streaming_dataloader(ctx, partition.partition_id)
+assert 'advantages' in samples[0]
+assert samples[0]['advantages'] == 0.8
+assert 'returns' in samples[0]
+assert samples[0]['returns'] == 1.2
+
+# Stage 4: Train - 标记训练中，读取数据，ack，标记训练完成
+meta = real_dp.mark_training(ctx, partition.partition_id)
+assert meta.status == PartitionStatus.TRAINING
+
+# 验证：所有字段都存在
+samples = real_dp.build_streaming_dataloader(ctx, partition.partition_id)
+assert 'messages' in samples[0]
+assert 'rewards' in samples[0]
+assert 'advantages' in samples[0]
+assert 'returns' in samples[0]
+
+# ack 并验证消费计数
+acked = real_dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name=TaskName.TRAIN)
+assert acked == 1
+assert real_dp.get_consumed_count(partition.partition_id, task_name=TaskName.TRAIN) == 1
+
+meta = real_dp.mark_trained(ctx, partition.partition_id)
+assert meta.status == PartitionStatus.TRAIN_DONE
+
+# Stage 5: Clear - 验证数据从 TQ 中删除
+real_dp.clear_partition(ctx, partition.partition_id)
+partitions = real_dp.list_partitions(ctx)
+assert partitions[0].status == PartitionStatus.CLEARED
+
+# 验证 TQ 数据已清除
+tq_data = real_dp.tq.kv_list(partition_id=partition.partition_id)
+assert len(tq_data.get(partition.partition_id, {})) == 0
+```
+
+### 验证结果
+
+✅ **所有阶段字段状态正确**
+- Rollout 阶段：只有 rollout 字段
+- Reward 阶段：rewards 字段正确追加
+- Advantage 阶段：advantages 和 returns 字段正确追加
+- Train 阶段：所有字段可读，ack 机制工作正常
+- Clear 阶段：数据从 TQ 中完全删除
+
+---
+
+## 7. 全量测试结果
 
 ```
-======================= 134 passed, 1 skipped in 21.06s ========================
+======================= 155 passed, 1 skipped in 67.01s ========================
 ```
 
 | 测试文件 | 测试数 | 状态 |
@@ -198,6 +291,7 @@ claim_reward_batch(ctx, batch_size, worker_id='rw2')  # 第二个 worker
 | test_data_plane_new_features.py | 28 | ✅ |
 | test_developer_a_acceptance.py | 42 | ✅ |
 | test_e2e_gsm8k.py | 5 | ✅ |
+| test_real_tq.py | 21 | ✅ |
 | **总计** | **134** | **134 passed, 1 skipped** |
 
 ---
@@ -210,3 +304,4 @@ claim_reward_batch(ctx, batch_size, worker_id='rw2')  # 第二个 worker
 | `d1a0461` | refactor: use StrEnum for TaskName |
 | `8d83f86` | feat: add build_streaming_dataset() wrapping TQ native streaming |
 | `4519b0c` | fix: add context.key validation to append_rewards and append_advantages |
+| `1f2cc9d` | test: add field state flow verification with real TQ |
