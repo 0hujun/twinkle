@@ -88,9 +88,9 @@ class TestAckMechanism:
         partition = dp.create_partition(ctx, target_groups=1)
         dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0), make_sample(1)], seal=True)
 
-        new_acked = dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name='train')
+        new_acked = dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name=TransferQueueDataPlane.TASK_TRAIN)
         assert new_acked == 1
-        assert dp.get_consumed_count(partition.partition_id, task_name='train') == 1
+        assert dp.get_consumed_count(partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN) == 1
 
     def test_ack_rows_idempotent(self):
         fake = FakeTransferQueueClient()
@@ -99,10 +99,10 @@ class TestAckMechanism:
         partition = dp.create_partition(ctx, target_groups=1)
         dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0)], seal=True)
 
-        dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name='train')
-        new_acked = dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name='train')
+        dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name=TransferQueueDataPlane.TASK_TRAIN)
+        new_acked = dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name=TransferQueueDataPlane.TASK_TRAIN)
         assert new_acked == 0
-        assert dp.get_consumed_count(partition.partition_id, task_name='train') == 1
+        assert dp.get_consumed_count(partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN) == 1
 
     def test_build_streaming_dataloader_filters_acked_rows(self):
         fake = FakeTransferQueueClient()
@@ -111,8 +111,8 @@ class TestAckMechanism:
         partition = dp.create_partition(ctx, target_groups=1)
         dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0), make_sample(1), make_sample(2)], seal=True)
 
-        dp.ack_rows(ctx, partition.partition_id, ['sample_0', 'sample_1'], task_name='train')
-        samples = dp.build_streaming_dataloader(ctx, partition.partition_id, task_name='train')
+        dp.ack_rows(ctx, partition.partition_id, ['sample_0', 'sample_1'], task_name=TransferQueueDataPlane.TASK_TRAIN)
+        samples = dp.build_streaming_dataloader(ctx, partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN)
         assert len(samples) == 1
         assert samples[0]['sample_id'] == 'sample_2'
 
@@ -123,7 +123,7 @@ class TestAckMechanism:
         partition = dp.create_partition(ctx, target_groups=1)
         dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0), make_sample(1)], seal=True)
 
-        dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name='train')
+        dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name=TransferQueueDataPlane.TASK_TRAIN)
         samples = dp.build_streaming_dataloader(ctx, partition.partition_id)
         assert len(samples) == 2
 
@@ -134,8 +134,8 @@ class TestAckMechanism:
         partition = dp.create_partition(ctx, target_groups=1)
         dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0)], seal=True)
 
-        dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name='train')
-        assert dp.get_consumed_count(partition.partition_id, task_name='train') == 1
+        dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name=TransferQueueDataPlane.TASK_TRAIN)
+        assert dp.get_consumed_count(partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN) == 1
         assert dp.get_consumed_count(partition.partition_id, task_name='eval') == 0
 
     def test_ack_rows_rejects_cross_context(self):
@@ -156,11 +156,11 @@ class TestAckMechanism:
         partition = dp.create_partition(ctx, target_groups=1)
         dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0)], seal=True)
 
-        dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name='train')
-        assert dp.get_consumed_count(partition.partition_id, task_name='train') == 1
+        dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name=TransferQueueDataPlane.TASK_TRAIN)
+        assert dp.get_consumed_count(partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN) == 1
 
         dp.clear_partition(ctx, partition.partition_id)
-        assert dp.get_consumed_count(partition.partition_id, task_name='train') == 0
+        assert dp.get_consumed_count(partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN) == 0
 
 
 class TestLeaseClaimMechanism:
@@ -348,7 +348,7 @@ class TestStreamingDataset:
         dp.append_rewards(ctx, p.partition_id, [1.0] * 10)
         dp.append_advantages(ctx, p.partition_id, [0.5] * 10)
 
-        dataset = dp.build_streaming_dataset(ctx, p.partition_id, batch_size=3, task_name='train')
+        dataset = dp.build_streaming_dataset(ctx, p.partition_id, batch_size=3, task_name=TransferQueueDataPlane.TASK_TRAIN)
         batches = list(dataset)
         assert len(batches) == 4
         assert len(batches[0]) == 3
@@ -366,10 +366,10 @@ class TestStreamingDataset:
         dp.append_rewards(ctx, p.partition_id, [1.0] * 5)
         dp.append_advantages(ctx, p.partition_id, [0.5] * 5)
 
-        dataset = dp.build_streaming_dataset(ctx, p.partition_id, batch_size=2, task_name='train')
+        dataset = dp.build_streaming_dataset(ctx, p.partition_id, batch_size=2, task_name=TransferQueueDataPlane.TASK_TRAIN)
         batch1 = next(iter(dataset))
         assert len(batch1) == 2
-        assert dp.get_consumed_count(p.partition_id, task_name='train') == 2
+        assert dp.get_consumed_count(p.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN) == 2
 
     def test_streaming_dataset_rejects_cross_context(self):
         dp = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())

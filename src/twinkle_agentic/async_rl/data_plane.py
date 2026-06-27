@@ -64,6 +64,11 @@ class TransferQueueRuntimeConfig:
 class TransferQueueDataPlane:
     """The only data-plane boundary for async RL TransferQueue access."""
 
+    TASK_ROLLOUT = 'rollout'
+    TASK_REWARD = 'reward'
+    TASK_ADVANTAGE = 'advantage'
+    TASK_TRAIN = 'train'
+
     def __init__(self, tq_client: Optional[Any] = None, tq_config: Optional[TransferQueueRuntimeConfig] = None):
         self.tq_config = tq_config or TransferQueueRuntimeConfig()
         self.tq = tq_client or self._init_transfer_queue(self.tq_config)
@@ -244,7 +249,7 @@ class TransferQueueDataPlane:
         *,
         worker_id: Optional[str] = None,
     ) -> tuple[PartitionMetadata, list[SampleRecord]]:
-        return self._claim_samples(context, batch_size, [PartitionStatus.ROLLOUT_DONE], 'reward', worker_id=worker_id)
+        return self._claim_samples(context, batch_size, [PartitionStatus.ROLLOUT_DONE], self.TASK_REWARD, worker_id=worker_id)
 
     def claim_reward_ready_groups(
         self,
@@ -313,7 +318,7 @@ class TransferQueueDataPlane:
         worker_id: Optional[str] = None,
     ) -> tuple[PartitionMetadata, list[SampleRecord]]:
         return self._claim_samples(
-            context, batch_size, [PartitionStatus.REWARD_DONE], 'advantage', worker_id=worker_id,
+            context, batch_size, [PartitionStatus.REWARD_DONE], self.TASK_ADVANTAGE, worker_id=worker_id,
         )
 
     def append_advantages(
@@ -357,7 +362,7 @@ class TransferQueueDataPlane:
         *,
         batch_size: int = 32,
         data_fields: Optional[List[str]] = None,
-        task_name: str = 'train',
+        task_name: Optional[str] = None,
         dp_rank: int = 0,
     ) -> '_StreamingDatasetWrapper':
         """Build a streaming dataset that wraps TQ Client API for batch iteration.
@@ -370,12 +375,14 @@ class TransferQueueDataPlane:
             partition_id: Partition to stream from
             batch_size: Number of samples per batch
             data_fields: Fields to retrieve (None = all fields)
-            task_name: Task name for consumption tracking
+            task_name: Task name for consumption tracking (defaults to TASK_TRAIN)
             dp_rank: Data parallel rank for distributed training
 
         Returns:
             _StreamingDatasetWrapper that yields list[SampleRecord] batches
         """
+        if task_name is None:
+            task_name = self.TASK_TRAIN
         meta = self._meta[partition_id]
         if meta.context.key != context.key:
             raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
@@ -423,8 +430,10 @@ class TransferQueueDataPlane:
         partition_id: str,
         sample_ids: List[str],
         *,
-        task_name: str = 'train',
+        task_name: Optional[str] = None,
     ) -> int:
+        if task_name is None:
+            task_name = self.TASK_TRAIN
         meta = self._meta.get(partition_id)
         if meta is not None and meta.context.key != context.key:
             raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
@@ -434,7 +443,9 @@ class TransferQueueDataPlane:
             consumed.update(sample_ids)
             return len(consumed) - before
 
-    def get_consumed_count(self, partition_id: str, *, task_name: str = 'train') -> int:
+    def get_consumed_count(self, partition_id: str, *, task_name: Optional[str] = None) -> int:
+        if task_name is None:
+            task_name = self.TASK_TRAIN
         return len(self._consumed[partition_id].get(task_name, set()))
 
     def claim_partition_with_lease(
