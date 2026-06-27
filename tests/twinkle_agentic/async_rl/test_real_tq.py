@@ -489,6 +489,80 @@ class TestRealTransferQueueDataPlane:
         partition_ids = [p.partition_id for p in qm]
         assert len(partition_ids) == 2
 
+    def test_metadata_stage_progress_with_real_tq(self, real_dp):
+        """Verify metadata reflects completion progress at each stage."""
+        ctx = make_context('progress_lora', tenant='progress_tenant', run='progress_run')
+        real_dp.init_namespace(ctx)
+        
+        # Create 4 partitions at different stages
+        p1 = real_dp.create_partition(ctx, target_groups=1)
+        p2 = real_dp.create_partition(ctx, target_groups=1)
+        p3 = real_dp.create_partition(ctx, target_groups=1)
+        p4 = real_dp.create_partition(ctx, target_groups=1)
+        
+        # p1: ROLLOUT_DONE
+        real_dp.put_rollout_batch(ctx, p1.partition_id, [make_sample(0)], seal=True)
+        
+        # p2: REWARD_DONE
+        real_dp.put_rollout_batch(ctx, p2.partition_id, [make_sample(1)], seal=True)
+        real_dp.append_rewards(ctx, p2.partition_id, [1.0])
+        
+        # p3: TRAIN_READY
+        real_dp.put_rollout_batch(ctx, p3.partition_id, [make_sample(2)], seal=True)
+        real_dp.append_rewards(ctx, p3.partition_id, [1.0])
+        real_dp.append_advantages(ctx, p3.partition_id, [0.5])
+        
+        # p4: TRAINING
+        real_dp.put_rollout_batch(ctx, p4.partition_id, [make_sample(3)], seal=True)
+        real_dp.append_rewards(ctx, p4.partition_id, [1.0])
+        real_dp.append_advantages(ctx, p4.partition_id, [0.5])
+        real_dp.mark_training(ctx, p4.partition_id)
+        
+        # Verify metadata at each stage
+        qm = real_dp.get_metadata(ctx)
+        assert qm.live_partition_count == 4
+        assert qm.total_rows == 4
+        assert qm.oldest_partition.partition_id == p1.partition_id
+        
+        # Count partitions at each stage
+        partitions = list(qm)
+        status_counts = {}
+        for p in partitions:
+            status_counts[p.status] = status_counts.get(p.status, 0) + 1
+        
+        assert status_counts.get(PartitionStatus.ROLLOUT_DONE, 0) == 1
+        assert status_counts.get(PartitionStatus.REWARD_DONE, 0) == 1
+        assert status_counts.get(PartitionStatus.TRAIN_READY, 0) == 1
+        assert status_counts.get(PartitionStatus.TRAINING, 0) == 1
+        
+        # Move p4 to TRAIN_DONE
+        real_dp.mark_trained(ctx, p4.partition_id)
+        
+        # Verify progress changed
+        qm = real_dp.get_metadata(ctx)
+        partitions = list(qm)
+        status_counts = {}
+        for p in partitions:
+            status_counts[p.status] = status_counts.get(p.status, 0) + 1
+        
+        assert status_counts.get(PartitionStatus.TRAINING, 0) == 0
+        assert status_counts.get(PartitionStatus.TRAIN_DONE, 0) == 1
+        
+        # Clear p4 and verify live count decreases
+        real_dp.clear_partition(ctx, p4.partition_id)
+        qm = real_dp.get_metadata(ctx)
+        assert qm.live_partition_count == 3
+        assert qm.total_rows == 3  # p4 data removed
+        
+        # Verify oldest is still p1
+        assert qm.oldest_partition.partition_id == p1.partition_id
+        
+        # Clear p1 and verify oldest changes to p2
+        real_dp.clear_partition(ctx, p1.partition_id)
+        qm = real_dp.get_metadata(ctx)
+        assert qm.live_partition_count == 2
+        assert qm.oldest_partition.partition_id == p2.partition_id
+
     def test_capacity_auto_calculation_with_real_tq(self):
         """Test capacity auto-calculation with real TQ backend."""
         config = TransferQueueRuntimeConfig(
