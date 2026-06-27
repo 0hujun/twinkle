@@ -35,7 +35,7 @@ class TransferQueueRuntimeConfig:
     estimate_bytes_per_sample: Optional[int] = None
     safety_factor: float = 1.2
 
-    # Capacity guard thresholds (None = auto-calculate)
+    # Capacity guard thresholds (None = auto-calculate in __post_init__)
     max_rows: Optional[int] = None
     max_rows_per_context: Optional[int] = None
     max_tq_bytes: Optional[int] = None
@@ -44,35 +44,21 @@ class TransferQueueRuntimeConfig:
     # Runtime
     lease_timeout: float = 300.0
 
-    def compute_max_rows(self) -> int:
-        """Auto-calculate max_rows from capacity planning inputs."""
+    def __post_init__(self):
         samples_per_partition = self.target_groups * self.num_generations
-        max_live = self.max_staleness + 1
-        return samples_per_partition * max_live
+        max_live_partitions = self.max_staleness + 1
 
-    def compute_max_live_partitions(self) -> int:
-        return self.max_staleness + 1
+        if self.max_rows is None:
+            self.max_rows = samples_per_partition * max_live_partitions
 
-    def compute_max_tq_bytes(self) -> Optional[int]:
-        if self.estimate_bytes_per_sample is None:
-            return None
-        return int(self.estimate_bytes_per_sample * self.compute_max_rows() * self.safety_factor)
+        if self.max_rows_per_context is None:
+            self.max_rows_per_context = self.max_rows
 
-    def resolve_max_rows(self) -> int:
-        """Return explicit max_rows or auto-calculated value."""
-        if self.max_rows is not None:
-            return self.max_rows
-        return self.compute_max_rows()
+        if self.max_tq_bytes is None and self.estimate_bytes_per_sample is not None:
+            self.max_tq_bytes = int(self.estimate_bytes_per_sample * self.max_rows * self.safety_factor)
 
-    def resolve_max_rows_per_context(self) -> int:
-        if self.max_rows_per_context is not None:
-            return self.max_rows_per_context
-        return self.resolve_max_rows()
-
-    def resolve_max_live_partitions_per_context(self) -> int:
-        if self.max_live_partitions_per_context is not None:
-            return self.max_live_partitions_per_context
-        return self.compute_max_live_partitions()
+        if self.max_live_partitions_per_context is None:
+            self.max_live_partitions_per_context = max_live_partitions
 
 
 class TransferQueueDataPlane:
@@ -109,13 +95,10 @@ class TransferQueueDataPlane:
         backend_config = dict(config.backend)
         simple_storage = dict(backend_config.get('SimpleStorage') or {})
         simple_storage.setdefault('num_data_storage_units', config.num_data_storage_units)
-        resolved_max_rows = config.resolve_max_rows()
         if config.total_storage_size is not None:
             simple_storage.setdefault('total_storage_size', config.total_storage_size)
-        elif config.estimate_bytes_per_sample is not None:
-            max_bytes = config.compute_max_tq_bytes()
-            if max_bytes is not None:
-                simple_storage.setdefault('total_storage_size', max_bytes)
+        elif config.max_tq_bytes is not None:
+            simple_storage.setdefault('total_storage_size', config.max_tq_bytes)
         backend_config.setdefault('storage_backend', config.storage_backend)
         backend_config['SimpleStorage'] = simple_storage
         return OmegaConf.create(
@@ -245,15 +228,12 @@ class TransferQueueDataPlane:
         live_partitions = [p for p in self.list_partitions() if p.status != PartitionStatus.CLEARED]
         total_rows = sum(p.num_rows for p in live_partitions)
         context_rows = sum(p.num_rows for p in live_partitions if p.context.key == context.key)
-        max_rows = self.tq_config.resolve_max_rows()
-        max_rows_per_ctx = self.tq_config.resolve_max_rows_per_context()
-        if total_rows >= max_rows:
+        if total_rows >= self.tq_config.max_rows:
             return False
-        if context_rows >= max_rows_per_ctx:
+        if context_rows >= self.tq_config.max_rows_per_context:
             return False
-        max_live = self.tq_config.resolve_max_live_partitions_per_context()
         context_live = len([p for p in live_partitions if p.context.key == context.key])
-        if context_live >= max_live:
+        if context_live >= self.tq_config.max_live_partitions_per_context:
             return False
         return True
 

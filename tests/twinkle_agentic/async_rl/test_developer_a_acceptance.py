@@ -86,53 +86,53 @@ def make_sample(i=0, group_id=None):
 
 class TestCapacityAutoCalculation:
 
-    def test_compute_max_rows_default(self):
+    def test_max_rows_auto_calculated_default(self):
         config = TransferQueueRuntimeConfig()
-        assert config.compute_max_rows() == 128 * 8 * (1 + 1)
+        assert config.max_rows == 128 * 8 * (1 + 1)
 
-    def test_compute_max_rows_custom(self):
+    def test_max_rows_auto_calculated_custom(self):
         config = TransferQueueRuntimeConfig(target_groups=64, num_generations=4, max_staleness=0)
-        assert config.compute_max_rows() == 64 * 4 * 1
+        assert config.max_rows == 64 * 4 * 1
 
-    def test_compute_max_live_partitions(self):
+    def test_max_live_partitions_per_context_auto(self):
         config = TransferQueueRuntimeConfig(max_staleness=2)
-        assert config.compute_max_live_partitions() == 3
+        assert config.max_live_partitions_per_context == 3
 
-    def test_compute_max_tq_bytes(self):
+    def test_max_tq_bytes_auto_calculated(self):
         config = TransferQueueRuntimeConfig(
             target_groups=10, num_generations=2, max_staleness=0,
             estimate_bytes_per_sample=1000, safety_factor=1.5,
         )
         expected = int(1000 * (10 * 2 * 1) * 1.5)
-        assert config.compute_max_tq_bytes() == expected
+        assert config.max_tq_bytes == expected
 
-    def test_compute_max_tq_bytes_none_when_no_estimate(self):
+    def test_max_tq_bytes_none_when_no_estimate(self):
         config = TransferQueueRuntimeConfig()
-        assert config.compute_max_tq_bytes() is None
+        assert config.max_tq_bytes is None
 
-    def test_resolve_max_rows_explicit_overrides_auto(self):
+    def test_max_rows_explicit_overrides_auto(self):
         config = TransferQueueRuntimeConfig(max_rows=500, target_groups=10, num_generations=2, max_staleness=0)
-        assert config.resolve_max_rows() == 500
+        assert config.max_rows == 500
 
-    def test_resolve_max_rows_auto_when_none(self):
+    def test_max_rows_auto_when_none(self):
         config = TransferQueueRuntimeConfig(target_groups=10, num_generations=2, max_staleness=0)
-        assert config.resolve_max_rows() == 20
+        assert config.max_rows == 20
 
-    def test_resolve_max_rows_per_context(self):
+    def test_max_rows_per_context_explicit(self):
         config = TransferQueueRuntimeConfig(max_rows_per_context=100)
-        assert config.resolve_max_rows_per_context() == 100
+        assert config.max_rows_per_context == 100
 
-    def test_resolve_max_rows_per_context_defaults_to_global(self):
+    def test_max_rows_per_context_defaults_to_global(self):
         config = TransferQueueRuntimeConfig(max_rows=500)
-        assert config.resolve_max_rows_per_context() == 500
+        assert config.max_rows_per_context == 500
 
-    def test_resolve_max_live_partitions_per_context(self):
+    def test_max_live_partitions_per_context_explicit(self):
         config = TransferQueueRuntimeConfig(max_live_partitions_per_context=5)
-        assert config.resolve_max_live_partitions_per_context() == 5
+        assert config.max_live_partitions_per_context == 5
 
-    def test_resolve_max_live_partitions_per_context_defaults(self):
+    def test_max_live_partitions_per_context_defaults(self):
         config = TransferQueueRuntimeConfig(max_staleness=3)
-        assert config.resolve_max_live_partitions_per_context() == 4
+        assert config.max_live_partitions_per_context == 4
 
     def test_check_capacity_uses_auto_calculated_max_rows(self):
         config = TransferQueueRuntimeConfig(target_groups=1, num_generations=2, max_staleness=0)
