@@ -291,6 +291,9 @@ class TransferQueueDataPlane:
         *,
         field_name: str = 'rewards',
     ) -> PartitionMetadata:
+        meta = self._meta.get(partition_id)
+        if meta is not None and meta.context.key != context.key:
+            raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
         samples = self._get_samples(partition_id)
         if len(rewards) != len(samples):
             raise ValueError(f'reward count {len(rewards)} does not match sample count {len(samples)}')
@@ -323,6 +326,9 @@ class TransferQueueDataPlane:
         advantages: list[float],
         returns: Optional[list[float]] = None,
     ) -> PartitionMetadata:
+        meta = self._meta.get(partition_id)
+        if meta is not None and meta.context.key != context.key:
+            raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
         samples = self._get_samples(partition_id)
         if len(advantages) != len(samples):
             raise ValueError(f'advantage count {len(advantages)} does not match sample count {len(samples)}')

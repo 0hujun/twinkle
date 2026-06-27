@@ -536,6 +536,66 @@ class TestDesignDocConsistency:
         with pytest.raises(ValueError, match='belongs to'):
             dp.build_streaming_dataloader(other, partition.partition_id)
 
+    def test_append_rewards_rejects_cross_context(self):
+        """append_rewards must reject cross-context access to prevent data corruption."""
+        ctx = make_context()
+        other = make_context('other')
+        dp = TransferQueueDataPlane(tq_client=RecordingFakeTQ())
+        partition = dp.create_partition(ctx, target_groups=1)
+        dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0)], seal=True)
+
+        with pytest.raises(ValueError, match='belongs to'):
+            dp.append_rewards(other, partition.partition_id, [1.0])
+
+    def test_append_advantages_rejects_cross_context(self):
+        """append_advantages must reject cross-context access to prevent data corruption."""
+        ctx = make_context()
+        other = make_context('other')
+        dp = TransferQueueDataPlane(tq_client=RecordingFakeTQ())
+        partition = dp.create_partition(ctx, target_groups=1)
+        dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0)], seal=True)
+        dp.append_rewards(ctx, partition.partition_id, [1.0])
+
+        with pytest.raises(ValueError, match='belongs to'):
+            dp.append_advantages(other, partition.partition_id, [0.5])
+
+    def test_cross_context_data_isolation(self):
+        """Verify that operations on one context cannot affect another context's data."""
+        ctx_a = make_context('tenant_a', run='run_a')
+        ctx_b = make_context('tenant_b', run='run_b')
+        dp = TransferQueueDataPlane(tq_client=RecordingFakeTQ())
+
+        # Create partitions for both contexts
+        partition_a = dp.create_partition(ctx_a, target_groups=1)
+        partition_b = dp.create_partition(ctx_b, target_groups=1)
+
+        # Add data to both partitions
+        dp.put_rollout_batch(ctx_a, partition_a.partition_id, [make_sample(0)], seal=True)
+        dp.put_rollout_batch(ctx_b, partition_b.partition_id, [make_sample(1)], seal=True)
+
+        # Try to append rewards using wrong context
+        with pytest.raises(ValueError, match='belongs to'):
+            dp.append_rewards(ctx_b, partition_a.partition_id, [2.0])
+
+        # Verify correct context can still append
+        dp.append_rewards(ctx_a, partition_a.partition_id, [1.0])
+
+        # Verify data integrity
+        samples_a = dp.build_streaming_dataloader(ctx_a, partition_a.partition_id)
+        assert len(samples_a) == 1
+        assert samples_a[0]['rewards'] == 1.0
+
+        # Try to append advantages using wrong context
+        with pytest.raises(ValueError, match='belongs to'):
+            dp.append_advantages(ctx_b, partition_a.partition_id, [0.5])
+
+        # Verify correct context can still append
+        dp.append_advantages(ctx_a, partition_a.partition_id, [0.5])
+
+        # Verify data integrity
+        samples_a = dp.build_streaming_dataloader(ctx_a, partition_a.partition_id)
+        assert samples_a[0]['advantages'] == 0.5
+
     def test_claim_reward_batch_returns_partition_and_samples(self):
         """claim_reward_batch must return (PartitionMetadata, list[SampleRecord])."""
         ctx = make_context()
