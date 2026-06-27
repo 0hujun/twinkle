@@ -7,7 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
-from .types import PartitionMetadata, PartitionStatus, QueueMetadata, SampleRecord, TrainingContext
+from .types import PartitionMetadata, PartitionStatus, QueueMetadata, SampleRecord, TaskName, TrainingContext
 
 
 @dataclass
@@ -63,11 +63,6 @@ class TransferQueueRuntimeConfig:
 
 class TransferQueueDataPlane:
     """The only data-plane boundary for async RL TransferQueue access."""
-
-    TASK_ROLLOUT = 'rollout'
-    TASK_REWARD = 'reward'
-    TASK_ADVANTAGE = 'advantage'
-    TASK_TRAIN = 'train'
 
     def __init__(self, tq_client: Optional[Any] = None, tq_config: Optional[TransferQueueRuntimeConfig] = None):
         self.tq_config = tq_config or TransferQueueRuntimeConfig()
@@ -249,7 +244,7 @@ class TransferQueueDataPlane:
         *,
         worker_id: Optional[str] = None,
     ) -> tuple[PartitionMetadata, list[SampleRecord]]:
-        return self._claim_samples(context, batch_size, [PartitionStatus.ROLLOUT_DONE], self.TASK_REWARD, worker_id=worker_id)
+        return self._claim_samples(context, batch_size, [PartitionStatus.ROLLOUT_DONE], TaskName.REWARD, worker_id=worker_id)
 
     def claim_reward_ready_groups(
         self,
@@ -318,7 +313,7 @@ class TransferQueueDataPlane:
         worker_id: Optional[str] = None,
     ) -> tuple[PartitionMetadata, list[SampleRecord]]:
         return self._claim_samples(
-            context, batch_size, [PartitionStatus.REWARD_DONE], self.TASK_ADVANTAGE, worker_id=worker_id,
+            context, batch_size, [PartitionStatus.REWARD_DONE], TaskName.ADVANTAGE, worker_id=worker_id,
         )
 
     def append_advantages(
@@ -382,7 +377,7 @@ class TransferQueueDataPlane:
             _StreamingDatasetWrapper that yields list[SampleRecord] batches
         """
         if task_name is None:
-            task_name = self.TASK_TRAIN
+            task_name = TaskName.TRAIN
         meta = self._meta[partition_id]
         if meta.context.key != context.key:
             raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
@@ -433,7 +428,7 @@ class TransferQueueDataPlane:
         task_name: Optional[str] = None,
     ) -> int:
         if task_name is None:
-            task_name = self.TASK_TRAIN
+            task_name = TaskName.TRAIN
         meta = self._meta.get(partition_id)
         if meta is not None and meta.context.key != context.key:
             raise ValueError(f'partition {partition_id} belongs to {meta.context.key}, not {context.key}')
@@ -445,7 +440,7 @@ class TransferQueueDataPlane:
 
     def get_consumed_count(self, partition_id: str, *, task_name: Optional[str] = None) -> int:
         if task_name is None:
-            task_name = self.TASK_TRAIN
+            task_name = TaskName.TRAIN
         return len(self._consumed[partition_id].get(task_name, set()))
 
     def claim_partition_with_lease(

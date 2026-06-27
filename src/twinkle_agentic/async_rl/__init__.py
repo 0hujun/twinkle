@@ -25,6 +25,7 @@ from .types import (
     QueueMetadata,
     RolloutCapacity,
     RolloutContextState,
+    TaskName,
     TrainingContext,
 )
 from .workers import AdvantageWorker, AsyncRollouter, RewardWorker, ToolManagerFactory, TrainerScheduler, TrainerWorker
@@ -53,6 +54,7 @@ __all__ = [
     'RolloutCapacity',
     'RolloutContextState',
     'StalenessManager',
+    'TaskName',
     'ToolManagerFactory',
     'TrainerScheduler',
     'TrainerWorker',

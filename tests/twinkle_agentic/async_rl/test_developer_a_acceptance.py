@@ -14,6 +14,7 @@ import pytest
 from twinkle_agentic.async_rl import (
     QueueMetadata,
     PartitionStatus,
+    TaskName,
     TrainingContext,
     TransferQueueDataPlane,
     TransferQueueRuntimeConfig,
@@ -491,9 +492,9 @@ class TestMultiWorkerClaimExclusion:
         dp.release_lease(p.partition_id, worker_id='aw1')
 
         dp.mark_training(ctx, p.partition_id)
-        dataloader = dp.build_streaming_dataloader(ctx, p.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN)
+        dataloader = dp.build_streaming_dataloader(ctx, p.partition_id, task_name=TaskName.TRAIN)
         assert len(dataloader) == 1
-        dp.ack_rows(ctx, p.partition_id, [dataloader[0]['sample_id']], task_name=TransferQueueDataPlane.TASK_TRAIN)
+        dp.ack_rows(ctx, p.partition_id, [dataloader[0]['sample_id']], task_name=TaskName.TRAIN)
         dp.mark_trained(ctx, p.partition_id)
 
         dp.clear_partition(ctx, p.partition_id)

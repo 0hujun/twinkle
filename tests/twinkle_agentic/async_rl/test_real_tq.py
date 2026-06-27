@@ -16,6 +16,7 @@ from twinkle_agentic.async_rl import (
     PartitionStatus,
     RewardWorker,
     StalenessManager,
+    TaskName,
     TrainingContext,
     TransferQueueDataPlane,
     TransferQueueRuntimeConfig,
@@ -252,28 +253,28 @@ class TestRealTransferQueueDataPlane:
         real_dp.append_rewards(ctx, partition.partition_id, [1.0] * 5)
         real_dp.append_advantages(ctx, partition.partition_id, [0.5] * 5)
         
-        # Read with task_name=TransferQueueDataPlane.TASK_TRAIN
-        dataloader = real_dp.build_streaming_dataloader(ctx, partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN)
+        # Read with task_name=TaskName.TRAIN
+        dataloader = real_dp.build_streaming_dataloader(ctx, partition.partition_id, task_name=TaskName.TRAIN)
         assert len(dataloader) == 5
         
         # Ack first 3 samples
-        acked = real_dp.ack_rows(ctx, partition.partition_id, ['sample_0', 'sample_1', 'sample_2'], task_name=TransferQueueDataPlane.TASK_TRAIN)
+        acked = real_dp.ack_rows(ctx, partition.partition_id, ['sample_0', 'sample_1', 'sample_2'], task_name=TaskName.TRAIN)
         assert acked == 3
-        assert real_dp.get_consumed_count(partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN) == 3
+        assert real_dp.get_consumed_count(partition.partition_id, task_name=TaskName.TRAIN) == 3
         
         # Read again, should only get 2 unacked samples
-        dataloader = real_dp.build_streaming_dataloader(ctx, partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN)
+        dataloader = real_dp.build_streaming_dataloader(ctx, partition.partition_id, task_name=TaskName.TRAIN)
         assert len(dataloader) == 2
         sample_ids = {s['sample_id'] for s in dataloader}
         assert sample_ids == {'sample_3', 'sample_4'}
         
         # Ack remaining
-        acked = real_dp.ack_rows(ctx, partition.partition_id, ['sample_3', 'sample_4'], task_name=TransferQueueDataPlane.TASK_TRAIN)
+        acked = real_dp.ack_rows(ctx, partition.partition_id, ['sample_3', 'sample_4'], task_name=TaskName.TRAIN)
         assert acked == 2
-        assert real_dp.get_consumed_count(partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN) == 5
+        assert real_dp.get_consumed_count(partition.partition_id, task_name=TaskName.TRAIN) == 5
         
         # Read again, should be empty
-        dataloader = real_dp.build_streaming_dataloader(ctx, partition.partition_id, task_name=TransferQueueDataPlane.TASK_TRAIN)
+        dataloader = real_dp.build_streaming_dataloader(ctx, partition.partition_id, task_name=TaskName.TRAIN)
         assert len(dataloader) == 0
 
     def test_claim_reward_ready_groups_with_real_tq(self, real_dp):
