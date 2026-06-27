@@ -125,6 +125,98 @@ class TestRealTransferQueueDataPlane:
         partitions = real_dp.list_partitions(ctx)
         assert partitions[0].status == PartitionStatus.CLEARED
 
+    def test_field_state_flow_with_real_tq(self, real_dp):
+        """Verify field state at each stage: rollout -> reward -> advantage -> train -> clear."""
+        ctx = make_context()
+        real_dp.init_namespace(ctx)
+        partition = real_dp.create_partition(ctx, target_groups=1)
+
+        # Stage 1: Rollout - write sample with messages, group_id, generation_idx, old_logps
+        sample = {
+            'sample_id': 'sample_0',
+            'messages': [{'role': 'user', 'content': 'What is 2+2?'}],
+            'group_id': 'group_0',
+            'generation_idx': 0,
+            'old_logps': [0.1, 0.2, 0.3],
+        }
+        meta = real_dp.put_rollout_batch(ctx, partition.partition_id, [sample], seal=True)
+        assert meta.status == PartitionStatus.ROLLOUT_DONE
+
+        # Verify fields after rollout
+        samples = real_dp.build_streaming_dataloader(ctx, partition.partition_id)
+        assert len(samples) == 1
+        s = samples[0]
+        assert 'messages' in s
+        assert 'group_id' in s
+        assert 'generation_idx' in s
+        assert 'old_logps' in s
+        assert s['group_id'] == 'group_0'
+        assert s['generation_idx'] == 0
+        assert 'rewards' not in s
+        assert 'advantages' not in s
+        assert 'returns' not in s
+
+        # Stage 2: Reward - append rewards field
+        meta = real_dp.append_rewards(ctx, partition.partition_id, [1.5])
+        assert meta.status == PartitionStatus.REWARD_DONE
+
+        # Verify fields after reward
+        samples = real_dp.build_streaming_dataloader(ctx, partition.partition_id)
+        s = samples[0]
+        assert 'messages' in s
+        assert 'group_id' in s
+        assert 'old_logps' in s
+        assert 'rewards' in s
+        assert s['rewards'] == 1.5
+        assert 'advantages' not in s
+        assert 'returns' not in s
+
+        # Stage 3: Advantage - append advantages and returns fields
+        meta = real_dp.append_advantages(ctx, partition.partition_id, [0.8], returns=[1.2])
+        assert meta.status == PartitionStatus.TRAIN_READY
+
+        # Verify fields after advantage
+        samples = real_dp.build_streaming_dataloader(ctx, partition.partition_id)
+        s = samples[0]
+        assert 'messages' in s
+        assert 'group_id' in s
+        assert 'old_logps' in s
+        assert 'rewards' in s
+        assert s['rewards'] == 1.5
+        assert 'advantages' in s
+        assert s['advantages'] == 0.8
+        assert 'returns' in s
+        assert s['returns'] == 1.2
+
+        # Stage 4: Train - mark training, read data, ack, mark trained
+        meta = real_dp.mark_training(ctx, partition.partition_id)
+        assert meta.status == PartitionStatus.TRAINING
+
+        samples = real_dp.build_streaming_dataloader(ctx, partition.partition_id)
+        s = samples[0]
+        assert 'messages' in s
+        assert 'group_id' in s
+        assert 'generation_idx' in s
+        assert 'old_logps' in s
+        assert 'rewards' in s
+        assert 'advantages' in s
+        assert 'returns' in s
+
+        acked = real_dp.ack_rows(ctx, partition.partition_id, ['sample_0'], task_name=TaskName.TRAIN)
+        assert acked == 1
+        assert real_dp.get_consumed_count(partition.partition_id, task_name=TaskName.TRAIN) == 1
+
+        meta = real_dp.mark_trained(ctx, partition.partition_id)
+        assert meta.status == PartitionStatus.TRAIN_DONE
+
+        # Stage 5: Clear - verify data is removed from TQ
+        real_dp.clear_partition(ctx, partition.partition_id)
+        partitions = real_dp.list_partitions(ctx)
+        assert partitions[0].status == PartitionStatus.CLEARED
+
+        tq_data = real_dp.tq.kv_list(partition_id=partition.partition_id)
+        assert len(tq_data.get(partition.partition_id, {})) == 0
+
     def test_reward_and_advantage_workers_with_real_tq(self, real_dp):
         ctx = make_context()
         real_dp.init_namespace(ctx)
@@ -410,8 +502,8 @@ class TestRealTransferQueueDataPlane:
         dp = TransferQueueDataPlane(tq_config=config)
         
         # Auto-calculated: max_rows = 2 * 4 * (1+1) = 16
-        assert config.compute_max_rows() == 16
-        assert config.compute_max_live_partitions() == 2
+        assert config.max_rows == 16
+        assert config.max_live_partitions_per_context == 2
         
         ctx = make_context('cap_auto_lora', tenant='cap_auto_tenant', run='cap_auto_run')
         dp.init_namespace(ctx)
