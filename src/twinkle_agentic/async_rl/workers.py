@@ -11,7 +11,8 @@ from twinkle_agentic.tools.tool_manager import ToolManager
 
 from .data_plane import TransferQueueDataPlane
 from .registry import AdapterRegistry
-from .scheduling import PreferCurrentTrainPolicy, WorkConservingRolloutPolicy
+from .scheduler import TrainerScheduler
+from .scheduling import WorkConservingRolloutPolicy
 from .staleness import StalenessManager
 from .types import ComponentResult, PartitionMetadata, PartitionStatus, RolloutContextState, SampleRecord, TrainingContext
 
@@ -277,27 +278,6 @@ class AdvantageWorker:
         return None
 
 
-class TrainerScheduler:
-
-    def __init__(self, *, adapter_registry: AdapterRegistry, train_policy: Optional[Any] = None):
-        self.adapter_registry = adapter_registry
-        self.train_policy = train_policy or PreferCurrentTrainPolicy()
-
-    def next_partition(
-        self,
-        candidates: List[PartitionMetadata],
-        current_context: Optional[TrainingContext] = None,
-    ) -> Optional[PartitionMetadata]:
-        filtered = []
-        for partition in candidates:
-            if partition.status != PartitionStatus.TRAIN_READY:
-                continue
-            if not self.adapter_registry.can_train(partition.context):
-                continue
-            filtered.append(partition)
-        return self.train_policy.pick_next_partition(filtered, current_context)
-
-
 @dataclass
 class TrainerStepResult:
     adapter_revision: Optional[str] = None
@@ -334,10 +314,7 @@ class TrainerWorker:
         self.current_context: Optional[TrainingContext] = None
 
     def step(self) -> Optional[ComponentResult]:
-        partition = self.scheduler.next_partition(
-            self.data_plane.list_train_ready_partitions(),
-            self.current_context,
-        )
+        partition = self.scheduler.next_partition(current_context=self.current_context)
         if partition is None:
             return None
         context = partition.context

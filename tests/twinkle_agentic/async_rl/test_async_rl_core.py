@@ -288,7 +288,7 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
     trainer = TrainerWorker(
         data_plane=data_plane,
         adapter_registry=registry,
-        scheduler=TrainerScheduler(adapter_registry=registry),
+        scheduler=TrainerScheduler(adapter_registry=registry, data_plane=data_plane),
         train_partition_fn=train_fn,
         receive_weights_fn=lambda ctx: received.append(ctx),
     )
