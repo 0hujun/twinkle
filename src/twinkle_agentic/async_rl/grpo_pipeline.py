@@ -129,6 +129,37 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
     )
 
 
+_MODEL_INPUT_FIELDS = {
+    'messages',
+    'input_ids',
+    'labels',
+    'attention_mask',
+    'position_ids',
+    'cu_seqlens',
+    'pixel_values',
+    'image_grid_thw',
+    'video_pixel_values',
+    'video_grid_thw',
+    'input_features',
+    'feature_attention_mask',
+}
+
+
+def model_input_from_training_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    """Return only model-consumable fields from a TQ training row.
+
+    TQ rows contain both model input fields and training/runtime metadata
+    such as old_logps, advantages, rewards, policy_version and group_id.
+    Those fields are consumed by the loss or scheduler, not by InputProcessor.
+    """
+    trajectory = sample.get('trajectory')
+    source = trajectory if isinstance(trajectory, dict) else sample
+    model_input = {key: value for key, value in source.items() if key in _MODEL_INPUT_FIELDS}
+    if not model_input:
+        raise ValueError(f'training sample has no model input fields: keys={sorted(source.keys())}')
+    return model_input
+
+
 class GSM8KBrevityReward:
     """Reward valid, shorter answers."""
 
@@ -397,7 +428,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         micro_batch_size = int(self.cfg.pipeline.micro_batch_size)
         for mb_start in range(0, len(batch), mini_batch_size):
             mini_batch = batch[mb_start:mb_start + mini_batch_size]
-            inputs = [sample.get('trajectory', sample) for sample in mini_batch]
+            inputs = [model_input_from_training_sample(sample) for sample in mini_batch]
             old_logps = [sample.get('old_logps', []) for sample in mini_batch]
             advantages = [sample.get('advantages', 0.0) for sample in mini_batch]
             self.model.forward_backward(
