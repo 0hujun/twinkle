@@ -347,10 +347,8 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 norm_type=int(self.cfg.pipeline.norm_type),
             )
 
-        save_name = (
-            f'{self.cfg.pipeline.save_name_prefix}-{context.training_run_id}-'
-            f'{context.adapter_name}-v{context.policy_version + 1}'
-        )
+        save_name = (f'{self.cfg.pipeline.save_name_prefix}-{context.training_run_id}-'
+                     f'{context.adapter_name}-v{context.policy_version + 1}')
         save_result = self.model.save(
             save_name,
             output_dir=self.cfg.model.adapter_checkpoint_dir,

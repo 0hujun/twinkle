@@ -1,14 +1,14 @@
 runtime:
   mode: ray
-  model_gpus: 4
-  sampler_gpus: 2
-  sampler_tp: 2
+  model_gpus: 1
+  sampler_gpus: 1
+  sampler_tp: 1
   lazy_collect: false
 
 training_context:
   tenant_id: tenant_a
   training_run_id: gsm8k_grpo_server_run_001
-  base_model_id: ms://Qwen/Qwen3.6-35B-A3B
+  base_model_id: ms://Qwen/Qwen3.5-0.8B
   adapter_name: tenant_a_gsm8k_lora
   reward_type: gsm8k
   loss_type: grpo
@@ -17,14 +17,14 @@ training_context:
 training_contexts:
   - tenant_id: tenant_a
     training_run_id: gsm8k_grpo_server_run_001
-    base_model_id: ms://Qwen/Qwen3.6-35B-A3B
+    base_model_id: ms://Qwen/Qwen3.5-0.8B
     adapter_name: tenant_a_gsm8k_lora
     reward_type: gsm8k
     loss_type: grpo
     tool_profile: default
   - tenant_id: tenant_b
     training_run_id: gsm8k_grpo_server_run_002
-    base_model_id: ms://Qwen/Qwen3.6-35B-A3B
+    base_model_id: ms://Qwen/Qwen3.5-0.8B
     adapter_name: tenant_b_gsm8k_lora
     reward_type: gsm8k
     loss_type: grpo
@@ -32,10 +32,10 @@ training_contexts:
 
 model:
   mesh:
-    tp_size: 2
-    ep_size: 2
-    pp_size: 2
-    sequence_parallel: true
+    tp_size: 1
+    ep_size: 1
+    pp_size: 1
+    sequence_parallel: false
   mixed_precision: bf16
   lora:
     target_modules: all-linear
