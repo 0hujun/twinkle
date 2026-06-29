@@ -28,6 +28,7 @@ training_contexts:
       split: train
       data_num: 2000
       batch_size: 4
+      max_length: 3072
       processor:
         cls: GSM8KProcessor
         system: >-
@@ -46,6 +47,7 @@ training_contexts:
       split: train
       data_num: 2000
       batch_size: 4
+      max_length: 3072
       processor:
         cls: GSM8KProcessor
         system: >-
@@ -95,7 +97,7 @@ sampler:
     cls: Qwen3_5Template
     enable_thinking: false
   sampling_params:
-    max_tokens: 4096
+    max_tokens: 1024
     num_samples: 1
     logprobs: 1
     temperature: 1.0

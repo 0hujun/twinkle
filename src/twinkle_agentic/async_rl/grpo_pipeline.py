@@ -87,7 +87,7 @@ def build_prompt_dataset_from_config(context_cfg: dict[str, Any], template_cfg: 
     dataset.set_template(
         _cfg_get(template_cfg, 'cls'),
         model_id=_cfg_get(context_cfg, 'base_model_id'),
-        max_length=_cfg_get(template_cfg, 'max_length', 4096),
+        max_length=_cfg_get(dataset_cfg, 'max_length', _cfg_get(template_cfg, 'max_length', 4096)),
         truncation_strategy=_cfg_get(template_cfg, 'truncation_strategy', 'delete'),
         enable_thinking=_cfg_get(template_cfg, 'enable_thinking', False),
     )
@@ -158,6 +158,27 @@ def model_input_from_training_sample(sample: dict[str, Any]) -> dict[str, Any]:
     if not model_input:
         raise ValueError(f'training sample has no model input fields: keys={sorted(source.keys())}')
     return model_input
+
+
+def validate_training_input_length(
+    model_input: dict[str, Any],
+    *,
+    context: TrainingContext,
+    partition_id: str,
+    max_length: int,
+) -> None:
+    input_ids = model_input.get('input_ids')
+    if input_ids is None:
+        return
+    length = len(input_ids)
+    if length <= max_length:
+        return
+    raise ValueError(
+        'training sample exceeds model.template.max_length: '
+        f'length={length}, max_length={max_length}, '
+        f'context={context.key}, partition_id={partition_id}. '
+        'Reduce sampler.sampling_params.max_tokens and dataset.max_length, '
+        'then clear old overlength TransferQueue partitions before rerun.')
 
 
 class GSM8KBrevityReward:
@@ -429,6 +450,13 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         for mb_start in range(0, len(batch), mini_batch_size):
             mini_batch = batch[mb_start:mb_start + mini_batch_size]
             inputs = [model_input_from_training_sample(sample) for sample in mini_batch]
+            for model_input in inputs:
+                validate_training_input_length(
+                    model_input,
+                    context=context,
+                    partition_id=partition_id,
+                    max_length=int(self.cfg.model.template.max_length),
+                )
             old_logps = [sample.get('old_logps', []) for sample in mini_batch]
             advantages = [sample.get('advantages', 0.0) for sample in mini_batch]
             self.model.forward_backward(
