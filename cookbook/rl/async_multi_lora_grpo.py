@@ -36,15 +36,20 @@ def build_device_meshes(cfg):
     sampler_tp = int(runtime.sampler_tp)
     total_gpus = model_gpus + sampler_gpus
     device_type = Platform.device_prefix()
-    device_groups = [
-        DeviceGroup(name='model', ranks=list(range(model_gpus)), device_type=device_type),
-        DeviceGroup(
-            name='sampler',
-            ranks=list(range(model_gpus, total_gpus)),
-            device_type=device_type,
-            gpus_per_worker=sampler_tp,
-        ),
-    ]
+    if runtime.mode == 'local':
+        device_groups = [
+            DeviceGroup(name='default', ranks=list(range(total_gpus)), device_type=device_type),
+        ]
+    else:
+        device_groups = [
+            DeviceGroup(name='model', ranks=list(range(model_gpus)), device_type=device_type),
+            DeviceGroup(
+                name='sampler',
+                ranks=list(range(model_gpus, total_gpus)),
+                device_type=device_type,
+                gpus_per_worker=sampler_tp,
+            ),
+        ]
     model_mesh_cfg = cfg.model.mesh
     model_mesh = DeviceMesh.from_sizes(
         world_size=model_gpus,

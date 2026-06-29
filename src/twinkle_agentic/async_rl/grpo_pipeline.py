@@ -203,11 +203,13 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         model = MultiLoraTransformersModel(
             model_id=primary_context.base_model_id,
             device_mesh=self.model_mesh,
-            remote_group='model',
             mixed_precision=self.cfg.model.mixed_precision,
             max_r=int(self.cfg.model.get('max_r', lora_cfg.r)),
             max_length=int(self.cfg.model.template.max_length),
             target_modules=lora_cfg.target_modules,
+            **({
+                'remote_group': 'model'
+            } if self.cfg.runtime.mode == 'ray' else {}),
             **model_kwargs,
         )
         loss_kwargs = {k: v for k, v in self.cfg.model.loss.items() if k != 'cls'}
@@ -256,7 +258,9 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             model_id=primary_context.base_model_id,
             engine_args=engine_args,
             device_mesh=self.sampler_mesh,
-            remote_group='sampler',
+            **({
+                'remote_group': 'sampler'
+            } if self.cfg.runtime.mode == 'ray' else {}),
         )
         sampler_template_kwargs = {k: v for k, v in self.cfg.sampler.template.items() if k != 'cls'}
         sampler.set_template(
