@@ -42,7 +42,14 @@ def build_training_contexts(cfg) -> list[TrainingContext]:
 
 
 def context_dataset_config(cfg, context_cfg):
-    return context_cfg.get('dataset', cfg.dataset)
+    dataset_cfg = context_cfg.get('dataset')
+    if dataset_cfg is not None:
+        return dataset_cfg
+    dataset_cfg = cfg.get('dataset')
+    if dataset_cfg is not None:
+        return dataset_cfg
+    raise ValueError('dataset config is required for each training context when top-level dataset is not set: '
+                     f'training_run_id={context_cfg.training_run_id}, adapter_name={context_cfg.adapter_name}')
 
 
 def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
@@ -220,11 +227,11 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 lr=float(self.cfg.model.optimizer.lr),
                 adapter_name=adapter_name,
             )
+            scheduler_kwargs = {k: v for k, v in self.cfg.model.lr_scheduler.items() if k != 'cls'}
             model.set_lr_scheduler(
                 self.cfg.model.lr_scheduler.cls,
-                lr_decay_steps=int(self.cfg.model.lr_scheduler.lr_decay_steps),
-                max_lr=float(self.cfg.model.lr_scheduler.max_lr),
                 adapter_name=adapter_name,
+                **scheduler_kwargs,
             )
             model.set_loss(self.cfg.model.loss.cls, adapter_name=adapter_name, **loss_kwargs)
             model.set_processor(InputProcessor, adapter_name=adapter_name)
