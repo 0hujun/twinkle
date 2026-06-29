@@ -27,7 +27,7 @@ class PromptFeeder:
         self.dataloader = dataloader
         self.rollouter = rollouter
         self.max_pending_groups = max_pending_groups
-        self._iterator = iter(dataloader)
+        self._iterator = None
         self.exhausted = False
         self.submitted_groups = 0
 
@@ -43,6 +43,8 @@ class PromptFeeder:
         """Read one dataloader batch and enqueue it as rollout prompt groups."""
         if not self.can_feed():
             return None
+        if self._iterator is None:
+            self._iterator = iter(self.dataloader)
         try:
             batch = next(self._iterator)
         except StopIteration:

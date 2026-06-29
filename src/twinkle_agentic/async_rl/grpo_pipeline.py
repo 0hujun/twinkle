@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import os
 from functools import partial
 from typing import Any, Dict, List
 
@@ -344,6 +345,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         max_pending_groups = self.cfg.pipeline.get('prompt_max_pending_groups')
         for context_cfg, context in zip(training_context_configs(self.cfg), self.contexts):
             dataset_cfg = context_dataset_config(self.cfg, context_cfg)
+            safe_context_key = re.sub(r'[^A-Za-z0-9_.-]+', '_', context.key)
             dataset_factory = partial(
                 build_prompt_dataset_from_config,
                 OmegaConf.to_container(context_cfg, resolve=True),
@@ -355,6 +357,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 min_batch_size=int(dataset_cfg.batch_size),
                 device_mesh=self.model_mesh,
                 remote_group='model',
+                instance_id=f'{os.getpid()}-{safe_context_key}-',
             )
             feeders.append(
                 PromptFeeder(
