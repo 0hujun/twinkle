@@ -1,14 +1,14 @@
 runtime:
-  mode: ray
-  model_gpus: 4
-  sampler_gpus: 2
-  sampler_tp: 2
+  mode: local
+  model_gpus: 1
+  sampler_gpus: 1
+  sampler_tp: 1
   lazy_collect: false
 
 training_context:
   tenant_id: tenant_a
   training_run_id: gsm8k_grpo_server_run_001
-  base_model_id: ms://Qwen/Qwen3.6-35B-A3B
+  base_model_id: ms://Qwen/Qwen3.5-0.8B
   adapter_name: tenant_a_gsm8k_lora
   reward_type: gsm8k
   loss_type: grpo
@@ -17,25 +17,49 @@ training_context:
 training_contexts:
   - tenant_id: tenant_a
     training_run_id: gsm8k_grpo_server_run_001
-    base_model_id: ms://Qwen/Qwen3.6-35B-A3B
+    base_model_id: ms://Qwen/Qwen3.5-0.8B
     adapter_name: tenant_a_gsm8k_lora
     reward_type: gsm8k
     loss_type: grpo
     tool_profile: default
+    dataset:
+      dataset_id: ms://modelscope/gsm8k
+      subset_name: main
+      split: train
+      data_num: 2000
+      batch_size: 4
+      max_length: 3072
+      processor:
+        cls: GSM8KProcessor
+        system: >-
+          You are a helpful math assistant. Solve the problem with minimal but
+          correct reasoning and put your final answer within \boxed{}.
   - tenant_id: tenant_b
     training_run_id: gsm8k_grpo_server_run_002
-    base_model_id: ms://Qwen/Qwen3.6-35B-A3B
+    base_model_id: ms://Qwen/Qwen3.5-0.8B
     adapter_name: tenant_b_gsm8k_lora
     reward_type: gsm8k
     loss_type: grpo
     tool_profile: default
+    dataset:
+      dataset_id: ms://modelscope/gsm8k
+      subset_name: main
+      split: train
+      data_num: 2000
+      batch_size: 4
+      max_length: 3072
+      processor:
+        cls: GSM8KProcessor
+        system: >-
+          You are a helpful math assistant. Solve the problem with minimal but
+          correct reasoning and put your final answer within \boxed{}.
 
 model:
   mesh:
-    tp_size: 2
-    ep_size: 2
-    pp_size: 2
-    sequence_parallel: true
+    tp_size: 1
+    ep_size: 1
+    pp_size: 1
+    sequence_parallel: false
   mixed_precision: bf16
   lora:
     target_modules: all-linear
@@ -47,12 +71,12 @@ model:
     cls: GRPOLoss
     epsilon: 0.2
   optimizer:
-    cls: default
+    cls: AdamW
     lr: 5.0e-5
   lr_scheduler:
-    cls: default
-    lr_decay_steps: 1000
-    max_lr: 5.0e-5
+    cls: LinearWarmupScheduler
+    num_warmup_steps: 0
+    num_training_steps: 1000
   processor:
     cls: InputProcessor
   template:
@@ -73,28 +97,19 @@ sampler:
     cls: Qwen3_5Template
     enable_thinking: false
   sampling_params:
-    max_tokens: 4096
+    max_tokens: 1024
     num_samples: 1
     logprobs: 1
     temperature: 1.0
     top_p: 0.95
   num_generations: 8
 
-dataset:
-  dataset_id: ms://modelscope/gsm8k
-  subset_name: main
-  split: train
-  data_num: 2000
-  batch_size: 4
-  system_prompt: >-
-    You are a helpful math assistant. Solve the problem with minimal but
-    correct reasoning and put your final answer within \boxed{}.
-
 pipeline:
   max_steps: 1000
   max_staleness: 1
   target_groups_per_partition: 1
   max_concurrent_groups: 16
+  max_submit_groups: 1
   reward_batch_size: 1024
   advantage_batch_size: 1024
   mini_batch_size: 4

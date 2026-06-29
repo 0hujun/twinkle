@@ -24,8 +24,8 @@ class TransferQueueRuntimeConfig:
     total_storage_size: Optional[int] = None
     num_data_storage_units: int = 4
     storage_backend: str = 'SimpleStorage'
-    controller: Dict[str, Any] = field(default_factory=dict)
-    backend: Dict[str, Any] = field(default_factory=dict)
+    controller: dict[str, Any] = field(default_factory=dict)
+    backend: dict[str, Any] = field(default_factory=dict)
     init: bool = True
 
     # Capacity planning inputs
@@ -64,7 +64,7 @@ class TransferQueueRuntimeConfig:
 class TransferQueueDataPlane:
     """The only data-plane boundary for async RL TransferQueue access."""
 
-    def __init__(self, tq_client: Optional[Any] = None, tq_config: Optional[TransferQueueRuntimeConfig] = None):
+    def __init__(self, tq_client: Any | None = None, tq_config: TransferQueueRuntimeConfig | None = None):
         self.tq_config = tq_config or TransferQueueRuntimeConfig()
         self.tq = tq_client or self._init_transfer_queue(self.tq_config)
         self._meta: Dict[str, PartitionMetadata] = {}
@@ -78,10 +78,8 @@ class TransferQueueDataPlane:
         try:
             import transfer_queue as tq
         except ImportError as exc:
-            raise RuntimeError(
-                'transfer_queue is required for TransferQueueDataPlane. '
-                'Pass an explicit tq_client only in unit tests/local mocks.'
-            ) from exc
+            raise RuntimeError('transfer_queue is required for TransferQueueDataPlane. '
+                               'Pass an explicit tq_client only in unit tests/local mocks.') from exc
         if config.init:
             tq.init(self._build_tq_config(config))
         return tq
@@ -102,7 +100,10 @@ class TransferQueueDataPlane:
         backend_config.setdefault('storage_backend', config.storage_backend)
         backend_config['SimpleStorage'] = simple_storage
         return OmegaConf.create(
-            {'controller': config.controller, 'backend': backend_config},
+            {
+                'controller': config.controller,
+                'backend': backend_config
+            },
             flags={'allow_objects': True},
         )
 
@@ -127,7 +128,7 @@ class TransferQueueDataPlane:
         context: TrainingContext,
         *,
         target_groups: int,
-        partition_id: Optional[str] = None,
+        partition_id: str | None = None,
     ) -> PartitionMetadata:
         partition_id = partition_id or self.next_partition_id(context)
         with self._lock:
@@ -148,7 +149,7 @@ class TransferQueueDataPlane:
         self,
         context: TrainingContext,
         partition_id: str,
-        trajectories: List[SampleRecord],
+        trajectories: list[SampleRecord],
         *,
         ready_groups: int = 1,
         seal: bool = False,
@@ -190,9 +191,9 @@ class TransferQueueDataPlane:
 
     def list_partitions(
         self,
-        context: Optional[TrainingContext] = None,
+        context: TrainingContext | None = None,
         *,
-        statuses: Optional[Iterable[PartitionStatus]] = None,
+        statuses: Iterable[PartitionStatus] | None = None,
     ) -> list[PartitionMetadata]:
         self._load_partition_meta()
         status_set = set(statuses) if statuses is not None else None
@@ -324,7 +325,7 @@ class TransferQueueDataPlane:
         context: TrainingContext,
         partition_id: str,
         advantages: list[float],
-        returns: Optional[list[float]] = None,
+        returns: list[float] | None = None,
     ) -> PartitionMetadata:
         meta = self._meta.get(partition_id)
         if meta is not None and meta.context.key != context.key:
@@ -660,7 +661,7 @@ class TransferQueueDataPlane:
         return [value for _ in range(size)]
 
     @staticmethod
-    def _meta_from_tag(partition_id: str, tag: Dict[str, Any], *, num_rows: int) -> Optional[PartitionMetadata]:
+    def _meta_from_tag(partition_id: str, tag: dict[str, Any], *, num_rows: int) -> PartitionMetadata | None:
         try:
             context = TrainingContext(
                 tenant_id=tag['tenant_id'],

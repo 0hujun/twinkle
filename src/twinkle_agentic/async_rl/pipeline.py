@@ -10,7 +10,7 @@ from .prompt_feeder import PromptFeeder
 from .registry import AdapterRegistry
 from .scheduler import TrainerScheduler, TrainerSchedulerConfig
 from .staleness import StalenessManager
-from .types import PartitionMetadata, SampleRecord, TrainingContext
+from .types import PartitionMetadata, RolloutCallable, SampleRecord, TrainingContext
 from .workers import (
     AdvantageWorker,
     AsyncRollouter,
@@ -33,7 +33,7 @@ class BaseRLPipelineConfig:
     rollout.
     """
 
-    training_contexts: Optional[list[TrainingContext]] = None
+    training_contexts: list[TrainingContext] | None = None
     tenant_id: str = 'default_tenant'
     training_run_id: str = 'default_run'
     base_model_id: str = ''
@@ -45,12 +45,13 @@ class BaseRLPipelineConfig:
     tool_profile: str = 'default'
     max_staleness: int = 0
     max_concurrent_groups: int = 16
+    max_submit_groups: int | None = None
     target_groups_per_partition: int = 1
     reward_batch_size: int = 1024
     advantage_batch_size: int = 1024
-    max_train_partitions: Optional[int] = None
+    max_train_partitions: int | None = None
     save_name_prefix: str = 'async-rl-sampler-weights'
-    adapter_checkpoint_dir: Optional[str] = None
+    adapter_checkpoint_dir: str | None = None
     save_optimizer: bool = False
     is_sampler_checkpoint: bool = True
     max_grad_norm: float = 1.0
@@ -82,8 +83,8 @@ class BaseRLPipeline:
     ):
         self.config = config
         self.model = None
-        self.rollout = None
-        self.reward_registry: Dict[str, Callable[..., list[float]]] = {}
+        self.rollout: RolloutCallable | None = None
+        self.reward_registry: dict[str, Callable[..., list[float]]] = {}
         self.data_plane = None
         self.adapter_registry = None
         self.staleness_manager = None
@@ -93,6 +94,7 @@ class BaseRLPipeline:
         self.train_policy = None
         self.train_partition_fn = None
         self.receive_weights_fn = None
+        self._sync_step_loop = None
 
         self.build_components()
         self.allocate_resources()
@@ -120,7 +122,7 @@ class BaseRLPipeline:
         """
         return None
 
-    def build_rollout(self) -> Any:
+    def build_rollout(self) -> RolloutCallable | None:
         """Build the rollout implementation resource.
 
         Subclasses should override this for YAML-driven jobs.
@@ -131,29 +133,27 @@ class BaseRLPipeline:
         """Build the TransferQueue data plane resource."""
         return TransferQueueDataPlane(tq_config=self.config.tq_config)
 
-    def build_reward_registry(self) -> Dict[str, Callable[..., list[float]]]:
+    def build_reward_registry(self) -> dict[str, Callable[..., list[float]]]:
         return {}
 
     def build_advantage_fn(
-        self,
-    ) -> Optional[Callable[[list[SampleRecord], TrainingContext], tuple[list[float], list[float]]]]:
+        self, ) -> Callable[[list[SampleRecord], TrainingContext], tuple[list[float], list[float]]] | None:
         return None
 
-    def build_tool_manager_factory(self) -> Optional[ToolManagerFactory]:
+    def build_tool_manager_factory(self) -> ToolManagerFactory | None:
         return None
 
-    def build_rollout_policy(self) -> Optional[Any]:
+    def build_rollout_policy(self) -> Any | None:
         return None
 
-    def build_train_policy(self) -> Optional[Any]:
+    def build_train_policy(self) -> Any | None:
         return None
 
     def build_train_partition_fn(
-        self,
-    ) -> Optional[Callable[[TrainingContext, str, Any], TrainerStepResult | Dict[str, Any] | None]]:
+        self, ) -> Callable[[TrainingContext, str, Any], TrainerStepResult | dict[str, Any] | None] | None:
         return None
 
-    def build_receive_weights_fn(self) -> Optional[Callable[[TrainingContext], None]]:
+    def build_receive_weights_fn(self) -> Callable[[TrainingContext], None] | None:
         return None
 
     def build_prompt_feeders(self) -> list[PromptFeeder]:
@@ -218,14 +218,12 @@ class BaseRLPipeline:
         """Create runtime roles for the default GRPO pipeline."""
         algorithm = self.config.algorithm.lower()
         if algorithm != 'grpo':
-            raise NotImplementedError(
-                f'BaseRLPipeline only defines default roles for algorithm={algorithm!r}. '
-                'Override create_roles() in an algorithm-specific pipeline.')
+            raise NotImplementedError(f'BaseRLPipeline only defines default roles for algorithm={algorithm!r}. '
+                                      'Override create_roles() in an algorithm-specific pipeline.')
         self.create_grpo_roles()
 
     def create_grpo_roles(self) -> None:
         """Create the default Multi-LoRA GRPO component graph."""
-        config = self.config
         if not self.reward_registry:
             self.reward_registry = self.build_reward_registry()
         self.advantage_fn = self.build_advantage_fn()
@@ -248,10 +246,12 @@ class BaseRLPipeline:
     def build_rollouter(
         self,
         *,
-        tool_manager_factory: Optional[ToolManagerFactory],
-        rollout_policy: Optional[Any],
+        tool_manager_factory: ToolManagerFactory | None,
+        rollout_policy: Any | None,
     ) -> AsyncRollouter:
         config = self.config
+        if self.rollout is None:
+            raise ValueError('build_rollouter requires a rollout implementation')
         return AsyncRollouter(
             data_plane=self.data_plane,
             adapter_registry=self.adapter_registry,
@@ -261,6 +261,7 @@ class BaseRLPipeline:
             rollout_policy=rollout_policy,
             max_concurrent_groups=config.max_concurrent_groups,
             target_groups_per_partition=config.target_groups_per_partition,
+            max_submit_groups=config.max_submit_groups,
         )
 
     def build_reward_worker(self) -> RewardWorker:
@@ -274,7 +275,7 @@ class BaseRLPipeline:
     def build_advantage_worker(
         self,
         *,
-        advantage_fn: Optional[Callable[[list[SampleRecord], TrainingContext], tuple[list[float], list[float]]]],
+        advantage_fn: Callable[[list[SampleRecord], TrainingContext], tuple[list[float], list[float]]] | None,
     ) -> AdvantageWorker:
         return AdvantageWorker(
             data_plane=self.data_plane,
@@ -367,10 +368,10 @@ class BaseRLPipeline:
         template_cls: str = 'Qwen3_5Template',
         processor_cls: str = 'InputProcessor',
         gradient_accumulation_steps: int = 1,
-        loss_kwargs: Optional[Dict[str, Any]] = None,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        template_kwargs: Optional[Dict[str, Any]] = None,
-        processor_kwargs: Optional[Dict[str, Any]] = None,
+        loss_kwargs: dict[str, Any] | None = None,
+        optimizer_kwargs: dict[str, Any] | None = None,
+        template_kwargs: dict[str, Any] | None = None,
+        processor_kwargs: dict[str, Any] | None = None,
     ) -> Any:
         """Create and configure MultiLoraTransformersModel like the GRPO cookbook."""
 
@@ -390,10 +391,10 @@ class BaseRLPipeline:
         model.set_template(template_cls, model_id=model_id, **(template_kwargs or {}))
         return model
 
-    def add_pending(self, samples: Iterable[SampleRecord], context: Optional[TrainingContext] = None) -> None:
+    def add_pending(self, samples: Iterable[SampleRecord], context: TrainingContext | None = None) -> None:
         self.submit_rollout_samples(samples, context=context)
 
-    def submit_rollout_samples(self, samples: Iterable[SampleRecord], context: Optional[TrainingContext] = None) -> None:
+    def submit_rollout_samples(self, samples: Iterable[SampleRecord], context: TrainingContext | None = None) -> None:
         """Submit prompt groups for rollout.
 
         These are not trainer batches. The trainer only reads samples that have
@@ -401,7 +402,7 @@ class BaseRLPipeline:
         """
         self.rollouter.enqueue_prompt_groups(context or self.current_context(), samples)
 
-    async def step_async(self) -> Dict[str, Optional[PartitionMetadata]]:
+    async def step_async(self) -> dict[str, PartitionMetadata | None]:
         step_result = {'rollout': None, 'reward': None, 'advantage': None, 'train': None}
         self._last_step_had_work = False
         for component in self.components:
@@ -415,19 +416,21 @@ class BaseRLPipeline:
                 step_result[result.kind] = result.metadata
         return step_result
 
-    def step(self) -> Dict[str, Optional[PartitionMetadata]]:
-        return asyncio.run(self.step_async())
+    def step(self) -> dict[str, PartitionMetadata | None]:
+        if self._sync_step_loop is None or self._sync_step_loop.is_closed():
+            self._sync_step_loop = asyncio.new_event_loop()
+        return self._sync_step_loop.run_until_complete(self.step_async())
 
     async def run_async(
         self,
-        rollout_samples: Optional[Iterable[SampleRecord]] = None,
+        rollout_samples: Iterable[SampleRecord] | None = None,
         *,
-        max_steps: Optional[int] = None,
-    ) -> list[Dict[str, Optional[PartitionMetadata]]]:
+        max_steps: int | None = None,
+    ) -> list[dict[str, PartitionMetadata | None]]:
         if rollout_samples is not None:
             self.submit_rollout_samples(rollout_samples)
         limit = max_steps if max_steps is not None else self.config.max_train_partitions
-        history: list[Dict[str, Optional[PartitionMetadata]]] = []
+        history: list[dict[str, PartitionMetadata | None]] = []
         trained = 0
         idle_steps = 0
         while limit is None or trained < limit:
@@ -442,17 +445,17 @@ class BaseRLPipeline:
                 idle_steps = 0
             else:
                 idle_steps += 1
-                if self._is_drained() or idle_steps >= 3:
+                if self._is_drained():
                     break
                 await asyncio.sleep(0)
         return history
 
     def run(
         self,
-        rollout_samples: Optional[Iterable[SampleRecord]] = None,
+        rollout_samples: Iterable[SampleRecord] | None = None,
         *,
-        max_steps: Optional[int] = None,
-    ) -> list[Dict[str, Optional[PartitionMetadata]]]:
+        max_steps: int | None = None,
+    ) -> list[dict[str, PartitionMetadata | None]]:
         """Drive the async RL loop.
 
         `rollout_samples` is an optional convenience feed for rollout prompts.
@@ -460,7 +463,7 @@ class BaseRLPipeline:
         """
         return asyncio.run(self.run_async(rollout_samples, max_steps=max_steps))
 
-    def run_until_idle(self, *, max_steps: Optional[int] = None) -> list[Dict[str, Optional[PartitionMetadata]]]:
+    def run_until_idle(self, *, max_steps: int | None = None) -> list[dict[str, PartitionMetadata | None]]:
         """Advance workers without adding new rollout prompts."""
         return self.run(max_steps=max_steps)
 
@@ -481,6 +484,9 @@ class BaseRLPipeline:
             shutdown = getattr(component, 'shutdown', None)
             if shutdown is not None:
                 shutdown()
+        if self._sync_step_loop is not None and not self._sync_step_loop.is_closed():
+            self._sync_step_loop.run_until_complete(asyncio.sleep(0))
+            self._sync_step_loop.close()
         close = getattr(getattr(self, 'data_plane', None), 'close', None)
         if close is not None:
             close()
@@ -493,11 +499,10 @@ class BaseRLPipeline:
         for compatibility; new algorithms should prefer overriding
         `build_trainer_worker()` or `build_pipeline_components()`.
         """
-        raise NotImplementedError(
-            'BaseRLPipeline.train_partition is a legacy override hook. '
-            'Use MultiLoraGRPOTrainerWorker or override build_trainer_worker().')
+        raise NotImplementedError('BaseRLPipeline.train_partition is a legacy override hook. '
+                                  'Use MultiLoraGRPOTrainerWorker or override build_trainer_worker().')
 
-    def current_context(self, context: Optional[TrainingContext] = None) -> TrainingContext:
+    def current_context(self, context: TrainingContext | None = None) -> TrainingContext:
         base_context = context or self.context
         record = self.adapter_registry.get(base_context)
         return base_context.with_policy_version(record.policy_version, record.adapter_revision)

@@ -11,10 +11,14 @@ class AdapterRegistry:
     """Runtime state table for one-LoRA-per-training-run async RL."""
 
     def __init__(self):
-        self._records: Dict[str, AdapterRecord] = {}
+        self._records: dict[str, AdapterRecord] = {}
         self._lock = threading.RLock()
 
-    def register(self, context: TrainingContext, *, weight: float = 1.0, state: AdapterState = AdapterState.ACTIVE) -> AdapterRecord:
+    def register(self,
+                 context: TrainingContext,
+                 *,
+                 weight: float = 1.0,
+                 state: AdapterState = AdapterState.ACTIVE) -> AdapterRecord:
         with self._lock:
             key = context.key
             existing = self._records.get(key)
@@ -54,11 +58,8 @@ class AdapterRegistry:
 
     def can_train(self, context: TrainingContext) -> bool:
         record = self.get(context)
-        return (
-            record.state == AdapterState.ACTIVE
-            and not record.sync_in_progress
-            and record.training_partition is None
-        )
+        return (record.state == AdapterState.ACTIVE and not record.sync_in_progress
+                and record.training_partition is None)
 
     def on_rollout_started(self, context: TrainingContext) -> None:
         with self._lock:
@@ -111,8 +112,8 @@ class AdapterRegistry:
         self,
         context: TrainingContext,
         *,
-        adapter_revision: Optional[str] = None,
-        policy_version: Optional[int] = None,
+        adapter_revision: str | None = None,
+        policy_version: int | None = None,
     ) -> TrainingContext:
         with self._lock:
             record = self.get(context)

@@ -261,7 +261,20 @@ def test_async_rollouter_and_trainer_worker_mvp_flow():
         max_concurrent_groups=1,
     )
     rollouter.add_pending(context, [make_sample(0)])
-    result = asyncio.run(rollouter.step())
+
+    async def drive_rollout():
+        submit_result = await rollouter.step()
+        assert submit_result is not None
+        assert submit_result.component == 'rollouter'
+        assert submit_result.kind == 'rollout_submit'
+        for _ in range(10):
+            result = await rollouter.step()
+            if result is not None and result.kind == 'rollout':
+                return result
+            await asyncio.sleep(0)
+        raise AssertionError('rollout task did not complete')
+
+    result = asyncio.run(drive_rollout())
     assert result is not None
     assert result.component == 'rollouter'
     assert result.kind == 'rollout'
@@ -309,27 +322,90 @@ def test_async_rollouter_accumulates_prompt_groups_into_one_train_partition():
     registry.register(context)
 
     class EchoRollout:
+        def __init__(self):
+            self.batch_sizes = []
+
         def __call__(self, trajectories, **kwargs):
+            self.batch_sizes.append(len(trajectories))
             return [dict(trajectory) for trajectory in trajectories]
 
+    rollout = EchoRollout()
     rollouter = AsyncRollouter(
         data_plane=data_plane,
         adapter_registry=registry,
         staleness_manager=StalenessManager(max_staleness=0, target_groups_per_partition=2),
-        rollout=EchoRollout(),
-        max_concurrent_groups=1,
+        rollout=rollout,
+        max_concurrent_groups=2,
         target_groups_per_partition=2,
     )
     rollouter.enqueue_prompt_groups(context, [make_sample(0), make_sample(1)])
 
-    first = asyncio.run(rollouter.step()).metadata
-    first_status = first.status
-    second = asyncio.run(rollouter.step()).metadata
+    async def drive_rollout():
+        submit_result = await rollouter.step()
+        assert submit_result is not None
+        assert submit_result.kind == 'rollout_submit'
+        assert submit_result.count == 2
+        for _ in range(10):
+            result = await rollouter.step()
+            if result is not None and result.kind == 'rollout':
+                return result
+            await asyncio.sleep(0)
+        raise AssertionError('rollout task did not complete')
 
-    assert first.partition_id == second.partition_id == context.partition_id(0)
-    assert first_status == PartitionStatus.OPEN
-    assert second.status == PartitionStatus.ROLLOUT_DONE
+    result = asyncio.run(drive_rollout())
+    meta = result.metadata
+
+    assert result.count == 2
+    assert rollout.batch_sizes == [2]
+    assert meta.partition_id == context.partition_id(0)
+    assert meta.status == PartitionStatus.ROLLOUT_DONE
     assert data_plane.list_partitions(context)[0].num_rows == 2
+
+
+def test_async_rollouter_writes_fast_task_before_slow_tail():
+    context = make_context('lora')
+    data_plane = TransferQueueDataPlane(tq_client=FakeTransferQueueClient())
+    registry = AdapterRegistry()
+    registry.register(context)
+
+    class VariableSpeedRollout:
+
+        async def __call__(self, trajectories, **kwargs):
+            delay = float(trajectories[0].get('delay', 0.0))
+            await asyncio.sleep(delay)
+            return [dict(trajectory) for trajectory in trajectories]
+
+    fast = make_sample(0)
+    fast['delay'] = 0.0
+    slow = make_sample(1)
+    slow['delay'] = 0.05
+    rollouter = AsyncRollouter(
+        data_plane=data_plane,
+        adapter_registry=registry,
+        staleness_manager=StalenessManager(max_staleness=1, target_groups_per_partition=1),
+        rollout=VariableSpeedRollout(),
+        max_concurrent_groups=2,
+        max_submit_groups=1,
+    )
+    rollouter.enqueue_prompt_groups(context, [slow, fast])
+
+    async def drive_until_first_rollout():
+        submit_result = await rollouter.step()
+        assert submit_result.kind == 'rollout_submit'
+        assert submit_result.count == 2
+        for _ in range(20):
+            result = await rollouter.step()
+            if result is not None and result.kind == 'rollout':
+                return result
+            await asyncio.sleep(0.005)
+        raise AssertionError('fast rollout task did not complete first')
+
+    result = asyncio.run(drive_until_first_rollout())
+
+    assert result.kind == 'rollout'
+    assert result.count == 1
+    assert data_plane.list_partitions(context)[0].num_rows == 1
+    assert not rollouter.is_idle()
 
 
 def test_prompt_feeder_is_pipeline_source_component():
