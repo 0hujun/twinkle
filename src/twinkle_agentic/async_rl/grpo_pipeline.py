@@ -168,9 +168,10 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         super().__init__(config=build_base_pipeline_config(cfg))
 
     def build_model(self):
+        from omegaconf import OmegaConf
         from peft import LoraConfig
 
-        from twinkle.model import MultiLoraMegatronModel
+        from twinkle.model import MultiLoraTransformersModel
         from twinkle.processor import InputProcessor
 
         primary_context = primary_training_context(self.cfg)
@@ -181,11 +182,26 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             lora_alpha=int(lora_cfg.lora_alpha),
             lora_dropout=float(lora_cfg.lora_dropout),
         )
-        model = MultiLoraMegatronModel(
+        model_kwargs = {
+            k: v
+            for k, v in OmegaConf.to_container(self.cfg.model, resolve=True).items() if k in {
+                'strategy',
+                'ddp_config',
+                'fsdp_config',
+                'grad_scaler_config',
+                'memory_efficient_init',
+                'max_loras',
+            }
+        }
+        model = MultiLoraTransformersModel(
             model_id=primary_context.base_model_id,
             device_mesh=self.model_mesh,
             remote_group='model',
             mixed_precision=self.cfg.model.mixed_precision,
+            max_r=int(self.cfg.model.get('max_r', lora_cfg.r)),
+            max_length=int(self.cfg.model.template.max_length),
+            target_modules=lora_cfg.target_modules,
+            **model_kwargs,
         )
         loss_kwargs = {k: v for k, v in self.cfg.model.loss.items() if k != 'cls'}
         template_kwargs = {
