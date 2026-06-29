@@ -95,6 +95,7 @@ pipeline:
   max_staleness: 1
   target_groups_per_partition: 1
   max_concurrent_groups: 16
+  max_submit_groups: 1
   reward_batch_size: 1024
   advantage_batch_size: 1024
   mini_batch_size: 4

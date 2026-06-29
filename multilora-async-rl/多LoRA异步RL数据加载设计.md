@@ -92,6 +92,10 @@ class PromptFeeder:
 ```text
 pending_prompt_groups_by_context:
   context.key -> queue[prompt_group]
+active_rollout_tasks:
+  task -> RolloutTaskState
+completed_rollout_results:
+  queue[completed TQ write result]
 ```
 
 它根据：
@@ -102,9 +106,10 @@ AdapterRegistry state
 TransferQueueDataPlane.check_capacity(context)
 rollout policy
 max_concurrent_groups
+max_submit_groups
 ```
 
-决定下一个要 rollout 的 LoRA。也就是说，`PromptFeeder` 只负责“喂数据”，真正的 LoRA rollout 调度仍然在 `AsyncRollouter` 内部完成。
+决定下一个要 rollout 的 LoRA。选中 context 后，`AsyncRollouter` 会从该 context 的 pending queue 中取出最多 `max_submit_groups` 个 prompt groups，组成一次同 context 的 rollout submit batch，并用 `asyncio.create_task` 放入 `active_rollout_tasks` 后立即返回。已经完成的 task 会进入 `completed_rollout_results`，下一轮 `step()` 返回 `kind="rollout"`，对应数据已经写入 TQ。也就是说，`PromptFeeder` 只负责“喂数据”，真正的 LoRA rollout 调度、异步提交和完成回收仍然在 `AsyncRollouter` 内部完成。
 
 ### 2.4 TrainerWorker 的 dataloader
 
@@ -195,7 +200,8 @@ PromptFeeder(context_b).step()
 
 AsyncRollouter.step()
   -> pick_next_rollout_context()
-  -> rollout selected context
+  -> submit rollout task
+  -> later collect completed task
   -> TransferQueueDataPlane.put_rollout_batch(context, train_k)
 ```
 

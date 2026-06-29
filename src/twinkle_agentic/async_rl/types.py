@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 
 class PartitionStatus(StrEnum):
@@ -202,3 +202,19 @@ RewardFn = Any
 AdvantageFn = Any
 TrainResult = Dict[str, Any]
 ContextKey = Tuple[str, str, str]
+
+
+class RolloutCallable(Protocol):
+    """Callable contract used by AsyncRollouter.
+
+    Implementations may be a concrete Rollout subclass, a server-side adapter,
+    or an async wrapper. The async RL layer only requires batched trajectory
+    input and iterable sample-row output.
+    """
+
+    def __call__(
+        self,
+        trajectories: Sequence[Any],
+        **kwargs: Any,
+    ) -> Iterable[SampleRecord] | Awaitable[Iterable[SampleRecord]]:
+        ...

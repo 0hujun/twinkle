@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -13,7 +14,8 @@ from .data_plane import TransferQueueDataPlane
 from .registry import AdapterRegistry
 from .scheduling import PreferCurrentTrainPolicy, WorkConservingRolloutPolicy
 from .staleness import StalenessManager
-from .types import ComponentResult, PartitionMetadata, PartitionStatus, RolloutContextState, SampleRecord, TrainingContext
+from .types import (ComponentResult, PartitionMetadata, PartitionStatus, RolloutCallable, RolloutContextState,
+                    SampleRecord, TrainingContext)
 
 
 class ToolManagerFactory:
@@ -36,6 +38,14 @@ class ToolManagerFactory:
         return factory(context, sample)
 
 
+@dataclass(frozen=True)
+class RolloutTaskState:
+    context: TrainingContext
+    prompt_groups: list[SampleRecord]
+    group_count: int
+    submitted_at: float
+
+
 class AsyncRollouter:
     """Schedule prompt groups, run rollout, and append results to train partitions."""
 
@@ -45,22 +55,28 @@ class AsyncRollouter:
         data_plane: TransferQueueDataPlane,
         adapter_registry: AdapterRegistry,
         staleness_manager: StalenessManager,
-        rollout,
+        rollout: RolloutCallable,
         tool_manager_factory: Optional[ToolManagerFactory] = None,
         rollout_policy: Optional[Any] = None,
         max_concurrent_groups: int = 16,
         target_groups_per_partition: int = 1,
+        max_submit_groups: Optional[int] = None,
     ):
         self.data_plane = data_plane
         self.adapter_registry = adapter_registry
         self.staleness_manager = staleness_manager
-        self.rollout = rollout
+        self.rollout: RolloutCallable = rollout
         self.tool_manager_factory = tool_manager_factory or ToolManagerFactory()
         self.rollout_policy = rollout_policy or WorkConservingRolloutPolicy()
         self.max_concurrent_groups = max_concurrent_groups
         self.target_groups_per_partition = target_groups_per_partition
+        self.max_submit_groups = max_submit_groups or target_groups_per_partition
         self.pending_prompt_groups_by_context: Dict[str, Deque[tuple[TrainingContext, SampleRecord]]] = defaultdict(deque)
-        self.active_rollout_tasks: set[asyncio.Task] = set()
+        self.active_rollout_tasks: Dict[asyncio.Task, RolloutTaskState] = {}
+        self.finished_rollout_tasks: Deque[asyncio.Task] = deque()
+        self.completed_rollout_results: Deque[ComponentResult] = deque()
+        self.active_prompt_groups_by_context: Dict[str, int] = defaultdict(int)
+        self.active_prompt_group_count = 0
         self._last_rollout_submit_time: Dict[str, float] = defaultdict(float)
         self._submitted_prompt_groups: Dict[str, int] = defaultdict(int)
 
@@ -110,6 +126,8 @@ class AsyncRollouter:
     def pick_next_rollout_context(self) -> Optional[TrainingContext]:
         """Choose the next context that is allowed to submit one prompt group."""
         states: list[RolloutContextState] = []
+        if self.remaining_group_capacity() <= 0:
+            return None
         seen: dict[str, TrainingContext] = {}
         for queue in self.pending_prompt_groups_by_context.values():
             if not queue:
@@ -117,15 +135,15 @@ class AsyncRollouter:
             context = queue[0][0]
             seen[context.key] = context
         for context in seen.values():
-            if len(self.active_rollout_tasks) >= self.max_concurrent_groups:
-                break
             if not self.adapter_registry.can_accept_rollout(context):
                 continue
             if not self.data_plane.check_capacity(context):
                 continue
             state = self.build_rollout_state(context)
-            if state is None or state.rollout_capacity <= 0:
+            active_groups = self.active_prompt_groups_by_context[context.key]
+            if state is None or state.rollout_capacity <= active_groups:
                 continue
+            state.rollout_capacity = max(0, state.rollout_capacity - active_groups)
             states.append(state)
         return self.rollout_policy.pick_next_context(states)
 
@@ -133,37 +151,135 @@ class AsyncRollouter:
         """Backward-compatible alias for `pick_next_rollout_context`."""
         return self.pick_next_rollout_context()
 
-    async def rollout_prompt_group(self, context: TrainingContext, prompt_group: SampleRecord) -> PartitionMetadata:
-        """Run rollout for one prompt group and append results to an open train partition."""
-        tool_manager = self.tool_manager_factory.create(prompt_group, context)
-        trajectory = prompt_group.get('trajectory') or prompt_group
+    def get_submit_group_count(self, context: TrainingContext) -> int:
+        """Return how many prompt groups can be submitted for this context now."""
+        queue = self.pending_prompt_groups_by_context.get(context.key)
+        if not queue:
+            return 0
+        state = self.build_rollout_state(context)
+        if state is None or state.rollout_capacity <= 0:
+            return 0
+        active_groups = self.active_prompt_groups_by_context[context.key]
+        context_capacity = max(0, state.rollout_capacity - active_groups)
+        return max(0, min(len(queue), context_capacity, self.max_submit_groups, self.remaining_group_capacity()))
+
+    def remaining_group_capacity(self) -> int:
+        return max(0, self.max_concurrent_groups - self.active_prompt_group_count)
+
+    def pop_prompt_groups(self, context: TrainingContext, count: int) -> list[SampleRecord]:
+        queue = self.pending_prompt_groups_by_context[context.key]
+        prompt_groups = []
+        for _ in range(min(count, len(queue))):
+            _, prompt_group = queue.popleft()
+            prompt_groups.append(prompt_group)
+        return prompt_groups
+
+    async def rollout_prompt_groups(
+        self,
+        context: TrainingContext,
+        prompt_groups: list[SampleRecord],
+    ) -> PartitionMetadata:
+        """Run rollout for a homogeneous prompt-group batch and append it to train_k."""
+        if not prompt_groups:
+            raise ValueError('rollout_prompt_groups requires at least one prompt group')
+
+        tool_manager = self.tool_manager_factory.create(prompt_groups[0], context)
+        trajectories = [prompt_group.get('trajectory') or prompt_group for prompt_group in prompt_groups]
         self.adapter_registry.on_rollout_started(context)
         try:
             rollout_kwargs = {'tool_manager': tool_manager, 'adapter_name': context.adapter_name}
             if context.adapter_revision is not None:
                 rollout_kwargs['adapter_path'] = context.adapter_revision
-            result = self.rollout([trajectory], **rollout_kwargs)
-            if asyncio.iscoroutine(result):
+            result = await self.invoke_rollout(trajectories, rollout_kwargs)
+            if inspect.isawaitable(result):
                 result = await result
-            trajectories = list(result)
+            rollout_rows = list(result)
             partition_id = self.get_or_create_open_partition(context)
             meta = self.data_plane.put_rollout_batch(
                 context,
                 partition_id,
-                trajectories,
-                ready_groups=1,
+                rollout_rows,
+                ready_groups=len(prompt_groups),
                 seal=False,
             )
             self.adapter_registry.on_partition_created(context, partition_id)
             self._last_rollout_submit_time[context.key] = time.time()
-            self._submitted_prompt_groups[context.key] += 1
+            self._submitted_prompt_groups[context.key] += len(prompt_groups)
             return meta
         finally:
             self.adapter_registry.on_rollout_finished(context)
 
+    async def rollout_prompt_group(self, context: TrainingContext, prompt_group: SampleRecord) -> PartitionMetadata:
+        """Backward-compatible single-group wrapper around `rollout_prompt_groups`."""
+        return await self.rollout_prompt_groups(context, [prompt_group])
+
     async def run_one_group(self, context: TrainingContext, sample: SampleRecord) -> PartitionMetadata:
         """Backward-compatible alias for `rollout_prompt_group`."""
         return await self.rollout_prompt_group(context, sample)
+
+    async def invoke_rollout(self, trajectories: list[Any], rollout_kwargs: dict[str, Any]):
+        """Call sync rollout implementations without blocking the event loop."""
+        call = getattr(self.rollout, '__call__', None)
+        if inspect.iscoroutinefunction(self.rollout) or inspect.iscoroutinefunction(call):
+            return await self.rollout(trajectories, **rollout_kwargs)
+        return await asyncio.to_thread(self.rollout, trajectories, **rollout_kwargs)
+
+    async def run_rollout_task(
+        self,
+        context: TrainingContext,
+        prompt_groups: list[SampleRecord],
+    ) -> ComponentResult:
+        meta = await self.rollout_prompt_groups(context, prompt_groups)
+        return ComponentResult(component='rollouter', kind='rollout', metadata=meta, count=len(prompt_groups))
+
+    def on_rollout_task_done(self, task: asyncio.Task) -> None:
+        self.finished_rollout_tasks.append(task)
+
+    def submit_rollout_tasks(self) -> int:
+        submitted_groups = 0
+        while self.remaining_group_capacity() > 0:
+            context = self.pick_next_rollout_context()
+            if context is None:
+                break
+            submit_count = self.get_submit_group_count(context)
+            if submit_count <= 0:
+                break
+            prompt_groups = self.pop_prompt_groups(context, submit_count)
+            task = asyncio.create_task(self.run_rollout_task(context, prompt_groups))
+            self.active_rollout_tasks[task] = RolloutTaskState(
+                context=context,
+                prompt_groups=prompt_groups,
+                group_count=len(prompt_groups),
+                submitted_at=time.time(),
+            )
+            self.active_prompt_group_count += len(prompt_groups)
+            self.active_prompt_groups_by_context[context.key] += len(prompt_groups)
+            task.add_done_callback(self.on_rollout_task_done)
+            submitted_groups += len(prompt_groups)
+        return submitted_groups
+
+    def collect_finished_rollout_tasks(self) -> None:
+        while self.finished_rollout_tasks:
+            task = self.finished_rollout_tasks.popleft()
+            state = self.active_rollout_tasks.pop(task, None)
+            if state is not None:
+                self.active_prompt_group_count = max(0, self.active_prompt_group_count - state.group_count)
+                context_key = state.context.key
+                self.active_prompt_groups_by_context[context_key] = max(
+                    0,
+                    self.active_prompt_groups_by_context[context_key] - state.group_count,
+                )
+                if self.active_prompt_groups_by_context[context_key] == 0:
+                    self.active_prompt_groups_by_context.pop(context_key, None)
+            if task.cancelled():
+                continue
+            try:
+                result = task.result()
+            except Exception as exc:
+                if state is not None:
+                    self.adapter_registry.mark_failed(state.context, str(exc))
+                raise
+            self.completed_rollout_results.append(result)
 
     def get_or_create_open_partition(self, context: TrainingContext) -> str:
         """Return the context's open train partition, or create the next train_k."""
@@ -174,16 +290,21 @@ class AsyncRollouter:
         return meta.partition_id
 
     async def step(self) -> Optional[ComponentResult]:
-        context = self.pick_next_rollout_context()
-        if context is None:
-            return None
-        queue = self.pending_prompt_groups_by_context[context.key]
-        _, prompt_group = queue.popleft()
-        meta = await self.rollout_prompt_group(context, prompt_group)
-        return ComponentResult(component='rollouter', kind='rollout', metadata=meta, count=1)
+        self.collect_finished_rollout_tasks()
+        submitted_groups = self.submit_rollout_tasks()
+        if self.completed_rollout_results:
+            return self.completed_rollout_results.popleft()
+        if submitted_groups:
+            return ComponentResult(component='rollouter', kind='rollout_submit', count=submitted_groups)
+        return None
 
     def is_idle(self) -> bool:
-        return not any(self.pending_prompt_groups_by_context.values()) and not self.active_rollout_tasks
+        return (
+            not any(self.pending_prompt_groups_by_context.values())
+            and not self.active_rollout_tasks
+            and not self.finished_rollout_tasks
+            and not self.completed_rollout_results
+        )
 
     def shutdown(self) -> None:
         for task in list(self.active_rollout_tasks):

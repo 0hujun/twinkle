@@ -62,6 +62,7 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
         max_staleness=int(cfg.pipeline.max_staleness),
         target_groups_per_partition=int(cfg.pipeline.target_groups_per_partition),
         max_concurrent_groups=int(cfg.pipeline.max_concurrent_groups),
+        max_submit_groups=cfg.pipeline.get('max_submit_groups'),
         reward_batch_size=int(cfg.pipeline.reward_batch_size),
         advantage_batch_size=int(cfg.pipeline.advantage_batch_size),
         max_train_partitions=int(cfg.pipeline.max_steps),

@@ -9,7 +9,7 @@ from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
 from .prompt_feeder import PromptFeeder
 from .registry import AdapterRegistry
 from .staleness import StalenessManager
-from .types import PartitionMetadata, SampleRecord, TrainingContext
+from .types import PartitionMetadata, RolloutCallable, SampleRecord, TrainingContext
 from .workers import (
     AdvantageWorker,
     AsyncRollouter,
@@ -45,6 +45,7 @@ class BaseRLPipelineConfig:
     tool_profile: str = 'default'
     max_staleness: int = 0
     max_concurrent_groups: int = 16
+    max_submit_groups: Optional[int] = None
     target_groups_per_partition: int = 1
     reward_batch_size: int = 1024
     advantage_batch_size: int = 1024
@@ -74,7 +75,7 @@ class BaseRLPipeline:
     ):
         self.config = config
         self.model = None
-        self.rollout = None
+        self.rollout: Optional[RolloutCallable] = None
         self.reward_registry: Dict[str, Callable[..., list[float]]] = {}
         self.data_plane = None
         self.adapter_registry = None
@@ -85,6 +86,7 @@ class BaseRLPipeline:
         self.train_policy = None
         self.train_partition_fn = None
         self.receive_weights_fn = None
+        self._sync_step_loop = None
 
         self.build_components()
         self.allocate_resources()
@@ -112,7 +114,7 @@ class BaseRLPipeline:
         """
         return None
 
-    def build_rollout(self) -> Any:
+    def build_rollout(self) -> Optional[RolloutCallable]:
         """Build the rollout implementation resource.
 
         Subclasses should override this for YAML-driven jobs.
@@ -244,6 +246,8 @@ class BaseRLPipeline:
         rollout_policy: Optional[Any],
     ) -> AsyncRollouter:
         config = self.config
+        if self.rollout is None:
+            raise ValueError('build_rollouter requires a rollout implementation')
         return AsyncRollouter(
             data_plane=self.data_plane,
             adapter_registry=self.adapter_registry,
@@ -253,6 +257,7 @@ class BaseRLPipeline:
             rollout_policy=rollout_policy,
             max_concurrent_groups=config.max_concurrent_groups,
             target_groups_per_partition=config.target_groups_per_partition,
+            max_submit_groups=config.max_submit_groups,
         )
 
     def build_reward_worker(self) -> RewardWorker:
@@ -392,7 +397,9 @@ class BaseRLPipeline:
         return step_result
 
     def step(self) -> Dict[str, Optional[PartitionMetadata]]:
-        return asyncio.run(self.step_async())
+        if self._sync_step_loop is None or self._sync_step_loop.is_closed():
+            self._sync_step_loop = asyncio.new_event_loop()
+        return self._sync_step_loop.run_until_complete(self.step_async())
 
     async def run_async(
         self,
@@ -418,7 +425,7 @@ class BaseRLPipeline:
                 idle_steps = 0
             else:
                 idle_steps += 1
-                if self._is_drained() or idle_steps >= 3:
+                if self._is_drained():
                     break
                 await asyncio.sleep(0)
         return history
@@ -457,6 +464,9 @@ class BaseRLPipeline:
             shutdown = getattr(component, 'shutdown', None)
             if shutdown is not None:
                 shutdown()
+        if self._sync_step_loop is not None and not self._sync_step_loop.is_closed():
+            self._sync_step_loop.run_until_complete(asyncio.sleep(0))
+            self._sync_step_loop.close()
         close = getattr(getattr(self, 'data_plane', None), 'close', None)
         if close is not None:
             close()

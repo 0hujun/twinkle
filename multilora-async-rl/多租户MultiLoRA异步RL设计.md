@@ -291,7 +291,7 @@ train_id = 3
 | 5 | `capacity / throttle hint` | `StalenessManager` 按当前 adapter 的 `max_staleness` 计算还能继续提交多少 rollout，以及是否需要 throttle 或 sleep。 |
 | 6 | `can_accept_rollout(context)` | `AsyncRollouter` 询问 `AdapterRegistry` 当前 adapter 是否处于可 rollout 状态，并检查 `in_flight_rollouts`、`live_partitions`、同步状态等运行时状态。 |
 | 7 | `check_capacity(context)` | `AsyncRollouter` 在提交前向 `TransferQueueDataPlane` 检查目标 namespace 的 TQ 容量是否还能接收新的 rollout rows。 |
-| 8 | `run_rollout(context)` | `AsyncRollouter` 选择一个 `TrainingContext` 后启动 rollout task。一次 submit batch 内只包含同一个 tenant/run/adapter；`policy_version` 作为每条 sample 的生成版本写入 metadata。 |
+| 8 | `run_rollout(context)` | `AsyncRollouter` 选择一个 `TrainingContext` 后启动 rollout task。一次 submit batch 内只包含同一个 tenant/run/adapter，但可以包含多个 prompt groups；`policy_version` 作为每条 sample 的生成版本写入 metadata。 |
 | 9 | `call native / remote tool` | `MultiTurnRollout` 在多轮交互中通过 `ToolManager` 调用 native tool 或 remote tool API。第一版不 import 用户 Env Python 代码。 |
 | 10 | `sample(adapter_name, policy_version)` | `MultiTurnRollout` 调用 `vLLMSampler` 生成模型回复。请求必须携带 `adapter_name` 和 `policy_version`，用于多 LoRA 路由和版本追踪。 |
 | 11 | `put_rollout_batch(context, train_k)` | rollout 完成一批 trajectory group 后，由 `AsyncRollouter` 写入对应 `train_k` partition。写入时附带 sample metadata。 |
@@ -487,7 +487,31 @@ policy:
 
 ### 4.1 Rollout 调度
 
-`AsyncRollouter` 负责多 LoRA rollout 侧调度。它内部维护 pending 和 active 状态，不需要单独引入 `RolloutScheduler` 组件。
+`AsyncRollouter` 负责多 LoRA rollout 侧调度。它内部维护 pending、active 和 completed 三类队列，不需要单独引入 `RolloutScheduler` 组件。
+
+```text
+pending_prompt_groups_by_context:
+  context.key -> queue[prompt_group]
+
+active_rollout_tasks:
+  asyncio.Task -> RolloutTaskState(context, prompt_groups, group_count, submitted_at)
+
+completed_rollout_results:
+  queue[ComponentResult(kind="rollout")]
+```
+
+`AsyncRollouter.step()` 是非阻塞驱动：
+
+```text
+1. 回收 finished tasks。
+2. 将已完成结果放入 completed_rollout_results。
+3. 在 capacity 允许时继续 submit 新 rollout tasks。
+4. 如果有 completed result，返回 kind="rollout"。
+5. 如果本轮只提交了 task，返回 kind="rollout_submit"。
+6. 如果无 pending、无完成结果、无可提交容量，返回 None。
+```
+
+rollout task 完成后立即通过 `TransferQueueDataPlane.put_rollout_batch()` 写入对应 `train_k` partition；不等待同一轮提交的其他 rollout task 全部完成。因此短任务可以先进入 TQ，长尾任务只拖慢自己。
 
 推荐状态：
 
@@ -514,11 +538,28 @@ class RolloutContextState:
 3. adapter 不在 sync_in_progress / draining / cancelled 状态。
 4. StalenessManager 判断当前 context 仍有 rollout capacity。
 5. TransferQueueDataPlane.check_capacity(context) 通过。
-6. 当前 context 的 in_flight_rollouts 未超过配置上限。
-7. AsyncRollouter 全局 active_tasks 未超过 max_concurrent_groups。
+6. AsyncRollouter 全局 active prompt groups 未超过 `max_concurrent_groups`。
 ```
 
 通过 gating 后再进入策略选择。
+
+选中 context 后，`AsyncRollouter` 会按批量提交 prompt groups。单次提交数量由以下值共同限制：
+
+```text
+pending prompt groups
+StalenessManager.rollout_capacity
+当前 context active prompt groups
+全局剩余 active prompt group capacity
+max_submit_groups
+```
+
+默认建议：
+
+```text
+max_submit_groups <= target_groups_per_partition
+```
+
+这样一次 rollout submit 可以提高 sampler / vLLM batch 利用率，同时不会把一个 `train_k` 写过目标 group 数。
 
 #### 4.1.1 吞吐优先策略
 
