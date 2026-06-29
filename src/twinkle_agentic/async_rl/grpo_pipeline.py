@@ -34,8 +34,7 @@ def build_training_contexts(cfg) -> list[TrainingContext]:
                 loss_type=context_cfg.loss_type,
                 tool_profile=context_cfg.get('tool_profile', 'default'),
                 algorithm=context_cfg.get('algorithm', cfg.pipeline.get('algorithm', 'grpo')),
-            )
-        )
+            ))
     base_models = {context.base_model_id for context in contexts}
     if len(base_models) != 1:
         raise ValueError(f'one async multi-LoRA job must use one base model, got {sorted(base_models)}')
@@ -78,7 +77,7 @@ def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
 class GSM8KBrevityReward:
     """Reward valid, shorter answers."""
 
-    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
+    def __call__(self, trajectories: list[dict[str, Any]], **kwargs) -> list[float]:
         rewards = []
         for traj in trajectories:
             messages = traj.get('messages', [])
@@ -87,10 +86,7 @@ class GSM8KBrevityReward:
                 if msg.get('role') == 'assistant':
                     completion = msg.get('content', '')
                     break
-            has_answer = bool(
-                re.search(r'\\boxed\{[^}]+\}', completion)
-                or re.search(r'####\s*[\-\d,\.]+', completion)
-            )
+            has_answer = bool(re.search(r'\\boxed\{[^}]+\}', completion) or re.search(r'####\s*[\-\d,\.]+', completion))
             if not has_answer:
                 rewards.append(0.0)
                 continue
@@ -107,7 +103,7 @@ class GSM8KReward:
         self.accuracy = GSM8KAccuracyReward()
         self.brevity = GSM8KBrevityReward()
 
-    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[float]:
+    def __call__(self, trajectories: list[dict[str, Any]], **kwargs) -> list[float]:
         accuracy = self.accuracy(trajectories)
         brevity = self.brevity(trajectories)
         return [a + b for a, b in zip(accuracy, brevity)]
@@ -121,7 +117,7 @@ class ServerSingleTurnRollout:
         self.sampling_params = sampling_params
         self.num_generations = num_generations
 
-    def __call__(self, trajectories: List[Dict[str, Any]], **kwargs) -> List[Dict[str, Any]]:
+    def __call__(self, trajectories: list[dict[str, Any]], **kwargs) -> list[dict[str, Any]]:
         adapter_path = kwargs.get('adapter_path')
         adapter_name = kwargs.get('adapter_name', '')
         expanded = []
@@ -173,6 +169,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
 
     def build_model(self):
         from peft import LoraConfig
+
         from twinkle.model import MultiLoraMegatronModel
         from twinkle.processor import InputProcessor
 
@@ -192,8 +189,8 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         )
         loss_kwargs = {k: v for k, v in self.cfg.model.loss.items() if k != 'cls'}
         template_kwargs = {
-            k: v for k, v in self.cfg.model.template.items()
-            if k not in {'cls', 'max_length', 'truncation_strategy'}
+            k: v
+            for k, v in self.cfg.model.template.items() if k not in {'cls', 'max_length', 'truncation_strategy'}
         }
         for context_cfg in training_context_configs(self.cfg):
             adapter_name = context_cfg.adapter_name
@@ -225,6 +222,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
 
     def build_rollout(self):
         from omegaconf import OmegaConf
+
         from twinkle.data_format import SamplingParams
         from twinkle.sampler import vLLMSampler
 
@@ -244,8 +242,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             **sampler_template_kwargs,
         )
         sampling_params = SamplingParams.from_dict(
-            OmegaConf.to_container(self.cfg.sampler.sampling_params, resolve=True)
-        )
+            OmegaConf.to_container(self.cfg.sampler.sampling_params, resolve=True))
         return ServerSingleTurnRollout(
             sampler,
             sampling_params=sampling_params,
@@ -262,8 +259,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 max_rows_per_context=tq_cfg.get('max_rows_per_context'),
                 num_data_storage_units=int(tq_cfg.get('num_data_storage_units', 4)),
                 storage_backend=tq_cfg.get('storage_backend', 'SimpleStorage'),
-            )
-        )
+            ))
 
     def build_prompt_feeders(self):
         from twinkle.dataloader import DataLoader
@@ -285,8 +281,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                     dataloader=dataloader,
                     rollouter=self.rollouter,
                     max_pending_groups=max_pending_groups,
-                )
-            )
+                ))
         return feeders
 
     def build_dataset(self, context_cfg):
@@ -302,8 +297,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 subset_name=dataset_cfg.get('subset_name'),
                 split=dataset_cfg.get('split', 'train'),
                 data_slice=data_slice,
-            )
-        )
+            ))
         template_cfg = self.cfg.model.template
         dataset.set_template(
             template_cfg.cls,
@@ -353,8 +347,12 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 norm_type=int(self.cfg.pipeline.norm_type),
             )
 
+        save_name = (
+            f'{self.cfg.pipeline.save_name_prefix}-{context.training_run_id}-'
+            f'{context.adapter_name}-v{context.policy_version + 1}'
+        )
         save_result = self.model.save(
-            f'{self.cfg.pipeline.save_name_prefix}-{context.training_run_id}-{context.adapter_name}-v{context.policy_version + 1}',
+            save_name,
             output_dir=self.cfg.model.adapter_checkpoint_dir,
             adapter_name=context.adapter_name,
             save_optimizer=bool(self.cfg.pipeline.save_optimizer),
@@ -364,7 +362,7 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         return TrainerStepResult(adapter_revision=adapter_revision)
 
 
-def grpo_advantage_fn(samples: List[Dict[str, Any]], context) -> tuple[list[float], list[float]]:
+def grpo_advantage_fn(samples: list[dict[str, Any]], context) -> tuple[list[float], list[float]]:
     from twinkle.advantage import GRPOAdvantage
 
     rewards = [float(sample.get('rewards', sample.get('reward', 0.0))) for sample in samples]

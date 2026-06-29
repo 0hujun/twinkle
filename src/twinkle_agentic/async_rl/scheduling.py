@@ -14,7 +14,7 @@ def _oldest_partition(partitions: Iterable[PartitionMetadata]) -> PartitionMetad
 class WorkConservingRolloutPolicy:
     """Prefer contexts that are most likely to keep trainer fed."""
 
-    def pick_next_context(self, candidates: List[RolloutContextState]) -> Optional[TrainingContext]:
+    def pick_next_context(self, candidates: list[RolloutContextState]) -> TrainingContext | None:
         candidates = [c for c in candidates if c.pending_groups > 0 and c.rollout_capacity > 0]
         if not candidates:
             return None
@@ -35,10 +35,10 @@ class DeficitFairRolloutPolicy:
 
     def __init__(self, quantum: float = 1.0):
         self.quantum = quantum
-        self.deficit: Dict[str, float] = defaultdict(float)
+        self.deficit: dict[str, float] = defaultdict(float)
         self._cursor = 0
 
-    def pick_next_context(self, candidates: List[RolloutContextState]) -> Optional[TrainingContext]:
+    def pick_next_context(self, candidates: list[RolloutContextState]) -> TrainingContext | None:
         candidates = [c for c in candidates if c.pending_groups > 0 and c.rollout_capacity > 0]
         if not candidates:
             return None
@@ -63,9 +63,9 @@ class PreferCurrentTrainPolicy:
 
     def pick_next_partition(
         self,
-        candidates: List[PartitionMetadata],
-        current_context: Optional[TrainingContext] = None,
-    ) -> Optional[PartitionMetadata]:
+        candidates: list[PartitionMetadata],
+        current_context: TrainingContext | None = None,
+    ) -> PartitionMetadata | None:
         if not candidates:
             return None
         if current_context is not None:
@@ -73,7 +73,7 @@ class PreferCurrentTrainPolicy:
             if same:
                 return _oldest_partition(same)
 
-        grouped: Dict[str, list[PartitionMetadata]] = defaultdict(list)
+        grouped: dict[str, list[PartitionMetadata]] = defaultdict(list)
         for partition in candidates:
             grouped[partition.context.key].append(partition)
         selected_group = max(
@@ -88,18 +88,18 @@ class DeficitFairTrainPolicy:
 
     def __init__(self, quantum: float = 1.0):
         self.quantum = quantum
-        self.deficit: Dict[str, float] = defaultdict(float)
+        self.deficit: dict[str, float] = defaultdict(float)
         self._cursor = 0
 
     def pick_next_partition(
         self,
-        candidates: List[PartitionMetadata],
-        current_context: Optional[TrainingContext] = None,
-    ) -> Optional[PartitionMetadata]:
+        candidates: list[PartitionMetadata],
+        current_context: TrainingContext | None = None,
+    ) -> PartitionMetadata | None:
         if not candidates:
             return None
-        grouped: Dict[str, list[PartitionMetadata]] = defaultdict(list)
-        weights: Dict[str, float] = {}
+        grouped: dict[str, list[PartitionMetadata]] = defaultdict(list)
+        weights: dict[str, float] = {}
         for partition in candidates:
             grouped[partition.context.key].append(partition)
             weights[partition.context.key] = 1.0

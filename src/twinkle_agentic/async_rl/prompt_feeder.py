@@ -21,7 +21,7 @@ class PromptFeeder:
         context: TrainingContext,
         dataloader: Iterable[Any],
         rollouter: AsyncRollouter,
-        max_pending_groups: Optional[int] = None,
+        max_pending_groups: int | None = None,
     ):
         self.context = context
         self.dataloader = dataloader
@@ -39,7 +39,7 @@ class PromptFeeder:
         pending = self.rollouter.pending_prompt_group_count(self.context)
         return pending < self.max_pending_groups
 
-    def step(self) -> Optional[ComponentResult]:
+    def step(self) -> ComponentResult | None:
         """Read one dataloader batch and enqueue it as rollout prompt groups."""
         if not self.can_feed():
             return None

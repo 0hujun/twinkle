@@ -13,34 +13,32 @@ from .types import PartitionMetadata, PartitionStatus, SampleRecord, TrainingCon
 class TransferQueueRuntimeConfig:
     """TransferQueue initialization and lightweight capacity guard config."""
 
-    total_storage_size: Optional[int] = None
-    max_rows: Optional[int] = None
-    max_rows_per_context: Optional[int] = None
+    total_storage_size: int | None = None
+    max_rows: int | None = None
+    max_rows_per_context: int | None = None
     num_data_storage_units: int = 4
     storage_backend: str = 'SimpleStorage'
-    controller: Dict[str, Any] = field(default_factory=dict)
-    backend: Dict[str, Any] = field(default_factory=dict)
+    controller: dict[str, Any] = field(default_factory=dict)
+    backend: dict[str, Any] = field(default_factory=dict)
     init: bool = True
 
 
 class TransferQueueDataPlane:
     """The only data-plane boundary for async RL TransferQueue access."""
 
-    def __init__(self, tq_client: Optional[Any] = None, tq_config: Optional[TransferQueueRuntimeConfig] = None):
+    def __init__(self, tq_client: Any | None = None, tq_config: TransferQueueRuntimeConfig | None = None):
         self.tq_config = tq_config or TransferQueueRuntimeConfig()
         self.tq = tq_client or self._init_transfer_queue(self.tq_config)
-        self._meta: Dict[str, PartitionMetadata] = {}
-        self._next_train_id: Dict[str, int] = defaultdict(int)
+        self._meta: dict[str, PartitionMetadata] = {}
+        self._next_train_id: dict[str, int] = defaultdict(int)
         self._lock = threading.RLock()
 
     def _init_transfer_queue(self, config: TransferQueueRuntimeConfig):
         try:
             import transfer_queue as tq
         except ImportError as exc:
-            raise RuntimeError(
-                'transfer_queue is required for TransferQueueDataPlane. '
-                'Pass an explicit tq_client only in unit tests/local mocks.'
-            ) from exc
+            raise RuntimeError('transfer_queue is required for TransferQueueDataPlane. '
+                               'Pass an explicit tq_client only in unit tests/local mocks.') from exc
         if config.init:
             tq.init(self._build_tq_config(config))
         return tq
@@ -59,7 +57,10 @@ class TransferQueueDataPlane:
         backend_config.setdefault('storage_backend', config.storage_backend)
         backend_config['SimpleStorage'] = simple_storage
         return OmegaConf.create(
-            {'controller': config.controller, 'backend': backend_config},
+            {
+                'controller': config.controller,
+                'backend': backend_config
+            },
             flags={'allow_objects': True},
         )
 
@@ -80,7 +81,7 @@ class TransferQueueDataPlane:
         context: TrainingContext,
         *,
         target_groups: int,
-        partition_id: Optional[str] = None,
+        partition_id: str | None = None,
     ) -> PartitionMetadata:
         partition_id = partition_id or self.next_partition_id(context)
         with self._lock:
@@ -101,7 +102,7 @@ class TransferQueueDataPlane:
         self,
         context: TrainingContext,
         partition_id: str,
-        trajectories: List[SampleRecord],
+        trajectories: list[SampleRecord],
         *,
         ready_groups: int = 1,
         seal: bool = False,
@@ -138,9 +139,9 @@ class TransferQueueDataPlane:
 
     def list_partitions(
         self,
-        context: Optional[TrainingContext] = None,
+        context: TrainingContext | None = None,
         *,
-        statuses: Optional[Iterable[PartitionStatus]] = None,
+        statuses: Iterable[PartitionStatus] | None = None,
     ) -> list[PartitionMetadata]:
         self._load_partition_meta()
         status_set = set(statuses) if statuses is not None else None
@@ -152,7 +153,7 @@ class TransferQueueDataPlane:
             partitions = [p for p in partitions if p.status in status_set]
         return sorted(partitions, key=lambda p: (p.created_at, p.partition_id))
 
-    def get_metadata(self, context: Optional[TrainingContext] = None) -> list[PartitionMetadata]:
+    def get_metadata(self, context: TrainingContext | None = None) -> list[PartitionMetadata]:
         return self.list_partitions(context)
 
     def check_capacity(self, context: TrainingContext) -> bool:
@@ -165,7 +166,8 @@ class TransferQueueDataPlane:
             return False
         return True
 
-    def claim_reward_batch(self, context: TrainingContext, batch_size: int) -> tuple[PartitionMetadata, list[SampleRecord]]:
+    def claim_reward_batch(self, context: TrainingContext,
+                           batch_size: int) -> tuple[PartitionMetadata, list[SampleRecord]]:
         return self._claim_samples(context, batch_size, [PartitionStatus.ROLLOUT_DONE], 'reward')
 
     def append_rewards(
@@ -190,7 +192,8 @@ class TransferQueueDataPlane:
         self._sync_partition_status(meta)
         return meta
 
-    def claim_advantage_batch(self, context: TrainingContext, batch_size: int) -> tuple[PartitionMetadata, list[SampleRecord]]:
+    def claim_advantage_batch(self, context: TrainingContext,
+                              batch_size: int) -> tuple[PartitionMetadata, list[SampleRecord]]:
         return self._claim_samples(context, batch_size, [PartitionStatus.REWARD_DONE], 'advantage')
 
     def append_advantages(
@@ -198,7 +201,7 @@ class TransferQueueDataPlane:
         context: TrainingContext,
         partition_id: str,
         advantages: list[float],
-        returns: Optional[list[float]] = None,
+        returns: list[float] | None = None,
     ) -> PartitionMetadata:
         samples = self._get_samples(partition_id)
         if len(advantages) != len(samples):
@@ -279,7 +282,7 @@ class TransferQueueDataPlane:
             samples.append(copied)
         return samples
 
-    def _update_samples(self, partition_id: str, updates: Dict[str, Dict[str, Any]]) -> None:
+    def _update_samples(self, partition_id: str, updates: dict[str, dict[str, Any]]) -> None:
         tags_by_key = self.tq.kv_list(partition_id=partition_id).get(partition_id, {})
         for key, fields in updates.items():
             self.tq.kv_put(
@@ -335,7 +338,7 @@ class TransferQueueDataPlane:
         return [value for _ in range(size)]
 
     @staticmethod
-    def _meta_from_tag(partition_id: str, tag: Dict[str, Any], *, num_rows: int) -> Optional[PartitionMetadata]:
+    def _meta_from_tag(partition_id: str, tag: dict[str, Any], *, num_rows: int) -> PartitionMetadata | None:
         try:
             context = TrainingContext(
                 tenant_id=tag['tenant_id'],

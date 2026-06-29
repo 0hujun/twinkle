@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional
 
 from twinkle_agentic.tools.tool_manager import ToolManager
-
 from .data_plane import TransferQueueDataPlane
 from .registry import AdapterRegistry
 from .scheduling import PreferCurrentTrainPolicy, WorkConservingRolloutPolicy
@@ -25,7 +24,7 @@ class ToolManagerFactory:
     without importing untrusted user code in the server process.
     """
 
-    def __init__(self, profiles: Optional[Dict[str, Callable[[TrainingContext, SampleRecord], ToolManager]]] = None):
+    def __init__(self, profiles: dict[str, Callable[[TrainingContext, SampleRecord], ToolManager]] | None = None):
         self._profiles = dict(profiles or {})
 
     def register(self, profile: str, factory: Callable[[TrainingContext, SampleRecord], ToolManager]) -> None:
@@ -56,11 +55,11 @@ class AsyncRollouter:
         adapter_registry: AdapterRegistry,
         staleness_manager: StalenessManager,
         rollout: RolloutCallable,
-        tool_manager_factory: Optional[ToolManagerFactory] = None,
-        rollout_policy: Optional[Any] = None,
+        tool_manager_factory: ToolManagerFactory | None = None,
+        rollout_policy: Any | None = None,
         max_concurrent_groups: int = 16,
         target_groups_per_partition: int = 1,
-        max_submit_groups: Optional[int] = None,
+        max_submit_groups: int | None = None,
     ):
         self.data_plane = data_plane
         self.adapter_registry = adapter_registry
@@ -71,14 +70,15 @@ class AsyncRollouter:
         self.max_concurrent_groups = max_concurrent_groups
         self.target_groups_per_partition = target_groups_per_partition
         self.max_submit_groups = max_submit_groups or target_groups_per_partition
-        self.pending_prompt_groups_by_context: Dict[str, Deque[tuple[TrainingContext, SampleRecord]]] = defaultdict(deque)
-        self.active_rollout_tasks: Dict[asyncio.Task, RolloutTaskState] = {}
+        self.pending_prompt_groups_by_context: dict[str, Deque[tuple[TrainingContext,
+                                                                     SampleRecord]]] = defaultdict(deque)
+        self.active_rollout_tasks: dict[asyncio.Task, RolloutTaskState] = {}
         self.finished_rollout_tasks: Deque[asyncio.Task] = deque()
         self.completed_rollout_results: Deque[ComponentResult] = deque()
-        self.active_prompt_groups_by_context: Dict[str, int] = defaultdict(int)
+        self.active_prompt_groups_by_context: dict[str, int] = defaultdict(int)
         self.active_prompt_group_count = 0
-        self._last_rollout_submit_time: Dict[str, float] = defaultdict(float)
-        self._submitted_prompt_groups: Dict[str, int] = defaultdict(int)
+        self._last_rollout_submit_time: dict[str, float] = defaultdict(float)
+        self._submitted_prompt_groups: dict[str, int] = defaultdict(int)
 
     def enqueue_prompt_groups(self, context: TrainingContext, prompt_groups: Iterable[SampleRecord]) -> None:
         """Append rollout inputs for a context.
@@ -99,7 +99,7 @@ class AsyncRollouter:
         """Backward-compatible alias for `enqueue_prompt_groups`."""
         self.enqueue_prompt_groups(context, samples)
 
-    def build_rollout_state(self, context: TrainingContext) -> Optional[RolloutContextState]:
+    def build_rollout_state(self, context: TrainingContext) -> RolloutContextState | None:
         """Collect current queue, staleness, partition, and adapter state for scheduling."""
         pending_groups = len(self.pending_prompt_groups_by_context.get(context.key, ()))
         if pending_groups <= 0:
@@ -123,7 +123,7 @@ class AsyncRollouter:
             weight=record.weight,
         )
 
-    def pick_next_rollout_context(self) -> Optional[TrainingContext]:
+    def pick_next_rollout_context(self) -> TrainingContext | None:
         """Choose the next context that is allowed to submit one prompt group."""
         states: list[RolloutContextState] = []
         if self.remaining_group_capacity() <= 0:
@@ -147,7 +147,7 @@ class AsyncRollouter:
             states.append(state)
         return self.rollout_policy.pick_next_context(states)
 
-    def pick_next_training_context(self) -> Optional[TrainingContext]:
+    def pick_next_training_context(self) -> TrainingContext | None:
         """Backward-compatible alias for `pick_next_rollout_context`."""
         return self.pick_next_rollout_context()
 
@@ -289,7 +289,7 @@ class AsyncRollouter:
         meta = self.data_plane.create_partition(context, target_groups=self.target_groups_per_partition)
         return meta.partition_id
 
-    async def step(self) -> Optional[ComponentResult]:
+    async def step(self) -> ComponentResult | None:
         self.collect_finished_rollout_tasks()
         submitted_groups = self.submit_rollout_tasks()
         if self.completed_rollout_results:
@@ -299,12 +299,8 @@ class AsyncRollouter:
         return None
 
     def is_idle(self) -> bool:
-        return (
-            not any(self.pending_prompt_groups_by_context.values())
-            and not self.active_rollout_tasks
-            and not self.finished_rollout_tasks
-            and not self.completed_rollout_results
-        )
+        return (not any(self.pending_prompt_groups_by_context.values()) and not self.active_rollout_tasks
+                and not self.finished_rollout_tasks and not self.completed_rollout_results)
 
     def shutdown(self) -> None:
         for task in list(self.active_rollout_tasks):
@@ -317,8 +313,8 @@ class RewardWorker:
         self,
         *,
         data_plane: TransferQueueDataPlane,
-        reward_registry: Dict[str, Callable[..., List[float]]],
-        contexts: Optional[List[TrainingContext]] = None,
+        reward_registry: dict[str, Callable[..., list[float]]],
+        contexts: list[TrainingContext] | None = None,
         batch_size: int = 1024,
     ):
         self.data_plane = data_plane
@@ -335,7 +331,7 @@ class RewardWorker:
         rewards = list(reward_fn(trajectories, context=context))
         return self.data_plane.append_rewards(context, meta.partition_id, rewards)
 
-    def step(self) -> Optional[ComponentResult]:
+    def step(self) -> ComponentResult | None:
         for context in self.contexts:
             try:
                 meta = self.run_once(context, batch_size=self.batch_size)
@@ -345,8 +341,9 @@ class RewardWorker:
         return None
 
     def is_idle(self) -> bool:
-        return not any(self.data_plane.list_partitions(context, statuses=[PartitionStatus.ROLLOUT_DONE])
-                       for context in self.contexts)
+        return not any(
+            self.data_plane.list_partitions(context, statuses=[PartitionStatus.ROLLOUT_DONE])
+            for context in self.contexts)
 
     def shutdown(self) -> None:
         return None
@@ -358,9 +355,9 @@ class AdvantageWorker:
         self,
         *,
         data_plane: TransferQueueDataPlane,
-        contexts: Optional[List[TrainingContext]] = None,
+        contexts: list[TrainingContext] | None = None,
         batch_size: int = 1024,
-        advantage_fn: Optional[Callable[[List[SampleRecord], TrainingContext], tuple[list[float], list[float]]]] = None,
+        advantage_fn: Callable[[list[SampleRecord], TrainingContext], tuple[list[float], list[float]]] | None = None,
     ):
         self.data_plane = data_plane
         self.contexts = list(contexts or [])
@@ -368,7 +365,7 @@ class AdvantageWorker:
         self.advantage_fn = advantage_fn or self._default_advantage_fn
 
     @staticmethod
-    def _default_advantage_fn(samples: List[SampleRecord], context: TrainingContext) -> tuple[list[float], list[float]]:
+    def _default_advantage_fn(samples: list[SampleRecord], context: TrainingContext) -> tuple[list[float], list[float]]:
         rewards = [float(sample.get('rewards', sample.get('reward', 0.0))) for sample in samples]
         if not rewards:
             return [], []
@@ -381,7 +378,7 @@ class AdvantageWorker:
         advantages, returns = self.advantage_fn(samples, context)
         return self.data_plane.append_advantages(context, meta.partition_id, advantages, returns)
 
-    def step(self) -> Optional[ComponentResult]:
+    def step(self) -> ComponentResult | None:
         for context in self.contexts:
             try:
                 meta = self.run_once(context, batch_size=self.batch_size)
@@ -391,8 +388,9 @@ class AdvantageWorker:
         return None
 
     def is_idle(self) -> bool:
-        return not any(self.data_plane.list_partitions(context, statuses=[PartitionStatus.REWARD_DONE])
-                       for context in self.contexts)
+        return not any(
+            self.data_plane.list_partitions(context, statuses=[PartitionStatus.REWARD_DONE])
+            for context in self.contexts)
 
     def shutdown(self) -> None:
         return None
@@ -400,15 +398,15 @@ class AdvantageWorker:
 
 class TrainerScheduler:
 
-    def __init__(self, *, adapter_registry: AdapterRegistry, train_policy: Optional[Any] = None):
+    def __init__(self, *, adapter_registry: AdapterRegistry, train_policy: Any | None = None):
         self.adapter_registry = adapter_registry
         self.train_policy = train_policy or PreferCurrentTrainPolicy()
 
     def next_partition(
         self,
-        candidates: List[PartitionMetadata],
-        current_context: Optional[TrainingContext] = None,
-    ) -> Optional[PartitionMetadata]:
+        candidates: list[PartitionMetadata],
+        current_context: TrainingContext | None = None,
+    ) -> PartitionMetadata | None:
         filtered = []
         for partition in candidates:
             if partition.status != PartitionStatus.TRAIN_READY:
@@ -421,19 +419,19 @@ class TrainerScheduler:
 
 @dataclass
 class TrainerStepResult:
-    adapter_revision: Optional[str] = None
-    metrics: Optional[Dict[str, Any]] = None
+    adapter_revision: str | None = None
+    metrics: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class MultiLoraGRPOTrainConfig:
     save_name_prefix: str = 'async-rl-sampler-weights'
-    adapter_checkpoint_dir: Optional[str] = None
+    adapter_checkpoint_dir: str | None = None
     save_optimizer: bool = False
     is_sampler_checkpoint: bool = True
     max_grad_norm: float = 1.0
     norm_type: int = 2
-    train_kwargs: Optional[Dict[str, Any]] = None
+    train_kwargs: dict[str, Any] | None = None
 
 
 class TrainerWorker:
@@ -444,17 +442,17 @@ class TrainerWorker:
         data_plane: TransferQueueDataPlane,
         adapter_registry: AdapterRegistry,
         scheduler: TrainerScheduler,
-        train_partition_fn: Callable[[TrainingContext, str, Any], TrainerStepResult | Dict[str, Any] | None],
-        receive_weights_fn: Optional[Callable[[TrainingContext], None]] = None,
+        train_partition_fn: Callable[[TrainingContext, str, Any], TrainerStepResult | dict[str, Any] | None],
+        receive_weights_fn: Callable[[TrainingContext], None] | None = None,
     ):
         self.data_plane = data_plane
         self.adapter_registry = adapter_registry
         self.scheduler = scheduler
         self.train_partition_fn = train_partition_fn
         self.receive_weights_fn = receive_weights_fn
-        self.current_context: Optional[TrainingContext] = None
+        self.current_context: TrainingContext | None = None
 
-    def step(self) -> Optional[ComponentResult]:
+    def step(self) -> ComponentResult | None:
         partition = self.scheduler.next_partition(
             self.data_plane.list_train_ready_partitions(),
             self.current_context,
@@ -486,7 +484,7 @@ class TrainerWorker:
             self.adapter_registry.mark_failed(context, str(exc))
             raise
 
-    def run_once(self) -> Optional[PartitionMetadata]:
+    def run_once(self) -> PartitionMetadata | None:
         result = self.step()
         return None if result is None else result.metadata
 
@@ -513,8 +511,8 @@ class MultiLoraGRPOTrainerWorker(TrainerWorker):
         adapter_registry: AdapterRegistry,
         scheduler: TrainerScheduler,
         model: Any,
-        train_config: Optional[MultiLoraGRPOTrainConfig] = None,
-        receive_weights_fn: Optional[Callable[[TrainingContext], None]] = None,
+        train_config: MultiLoraGRPOTrainConfig | None = None,
+        receive_weights_fn: Callable[[TrainingContext], None] | None = None,
     ):
         self.model = model
         self.train_config = train_config or MultiLoraGRPOTrainConfig()

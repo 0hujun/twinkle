@@ -19,7 +19,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 import twinkle
-from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
+from twinkle import DeviceGroup, DeviceMesh, Platform, get_device_placement, get_logger
 from twinkle_agentic.async_rl import AsyncMultiLoraGRPOPipeline
 
 logger = get_logger()
@@ -35,12 +35,13 @@ def build_device_meshes(cfg):
     sampler_gpus = int(runtime.sampler_gpus)
     sampler_tp = int(runtime.sampler_tp)
     total_gpus = model_gpus + sampler_gpus
+    device_type = Platform.device_prefix()
     device_groups = [
-        DeviceGroup(name='model', ranks=list(range(model_gpus)), device_type='GPU'),
+        DeviceGroup(name='model', ranks=list(range(model_gpus)), device_type=device_type),
         DeviceGroup(
             name='sampler',
             ranks=list(range(model_gpus, total_gpus)),
-            device_type='GPU',
+            device_type=device_type,
             gpus_per_worker=sampler_tp,
         ),
     ]
