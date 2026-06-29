@@ -446,7 +446,6 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
     def train_partition(self, context, partition_id: str, dataloader) -> TrainerStepResult:
         batch = list(dataloader)
         mini_batch_size = int(self.cfg.pipeline.mini_batch_size)
-        micro_batch_size = int(self.cfg.pipeline.micro_batch_size)
         for mb_start in range(0, len(batch), mini_batch_size):
             mini_batch = batch[mb_start:mb_start + mini_batch_size]
             inputs = [model_input_from_training_sample(sample) for sample in mini_batch]
@@ -463,7 +462,6 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
                 inputs=inputs,
                 old_logps=old_logps,
                 advantages=advantages,
-                micro_batch_size=micro_batch_size,
                 adapter_name=context.adapter_name,
             )
             self.model.clip_grad_and_step(
