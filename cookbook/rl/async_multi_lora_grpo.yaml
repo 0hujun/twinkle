@@ -28,9 +28,11 @@ training_contexts:
       split: train
       data_num: 2000
       batch_size: 4
-      system_prompt: >-
-        You are a helpful math assistant. Solve the problem with minimal but
-        correct reasoning and put your final answer within \boxed{}.
+      processor:
+        cls: GSM8KProcessor
+        system: >-
+          You are a helpful math assistant. Solve the problem with minimal but
+          correct reasoning and put your final answer within \boxed{}.
   - tenant_id: tenant_b
     training_run_id: gsm8k_grpo_server_run_002
     base_model_id: ms://Qwen/Qwen3.5-0.8B
@@ -44,9 +46,11 @@ training_contexts:
       split: train
       data_num: 2000
       batch_size: 4
-      system_prompt: >-
-        You are a helpful math assistant. Solve the problem with minimal but
-        correct reasoning and put your final answer within \boxed{}.
+      processor:
+        cls: GSM8KProcessor
+        system: >-
+          You are a helpful math assistant. Solve the problem with minimal but
+          correct reasoning and put your final answer within \boxed{}.
 
 model:
   mesh:

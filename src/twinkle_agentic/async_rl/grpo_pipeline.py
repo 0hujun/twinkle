@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from functools import partial
 from typing import Any, Dict, List
 
 from .data_plane import TransferQueueDataPlane, TransferQueueRuntimeConfig
@@ -50,6 +51,52 @@ def context_dataset_config(cfg, context_cfg):
         return dataset_cfg
     raise ValueError('dataset config is required for each training context when top-level dataset is not set: '
                      f'training_run_id={context_cfg.training_run_id}, adapter_name={context_cfg.adapter_name}')
+
+
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return cfg.get(key, default)
+
+
+def build_prompt_dataset_from_config(context_cfg: dict[str, Any], template_cfg: dict[str, Any]):
+    """Build a prompt dataset inside the DataLoader worker.
+
+    This function must stay top-level and only receive serializable config
+    values, because Ray serializes the callable passed to twinkle.dataloader.DataLoader.
+    """
+    import twinkle.preprocessor
+    from twinkle.dataset import Dataset, DatasetMeta
+    from twinkle.preprocessor import Preprocessor
+    from twinkle.utils import construct_class
+
+    dataset_cfg = _cfg_get(context_cfg, 'dataset')
+    if dataset_cfg is None:
+        raise ValueError(f'training context {context_cfg.get("training_run_id")} has no dataset config')
+    data_num = _cfg_get(dataset_cfg, 'data_num')
+    data_slice = range(int(data_num)) if data_num else None
+    dataset = Dataset()
+    dataset.add_dataset(
+        DatasetMeta(
+            _cfg_get(dataset_cfg, 'dataset_id'),
+            subset_name=_cfg_get(dataset_cfg, 'subset_name'),
+            split=_cfg_get(dataset_cfg, 'split', 'train'),
+            data_slice=data_slice,
+        ))
+    dataset.set_template(
+        _cfg_get(template_cfg, 'cls'),
+        model_id=_cfg_get(context_cfg, 'base_model_id'),
+        max_length=_cfg_get(template_cfg, 'max_length', 4096),
+        truncation_strategy=_cfg_get(template_cfg, 'truncation_strategy', 'delete'),
+        enable_thinking=_cfg_get(template_cfg, 'enable_thinking', False),
+    )
+    processor_cfg = _cfg_get(dataset_cfg, 'processor')
+    if processor_cfg is not None:
+        processor_cls = _cfg_get(processor_cfg, 'cls')
+        processor_kwargs = {k: v for k, v in processor_cfg.items() if k != 'cls'}
+        dataset.map(construct_class(processor_cls, Preprocessor, twinkle.preprocessor, **processor_kwargs))
+    dataset.encode(add_generation_prompt=bool(_cfg_get(dataset_cfg, 'add_generation_prompt', True)))
+    return dataset
 
 
 def build_base_pipeline_config(cfg) -> BaseRLPipelineConfig:
@@ -289,14 +336,21 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
             ))
 
     def build_prompt_feeders(self):
+        from omegaconf import OmegaConf
+
         from twinkle.dataloader import DataLoader
 
         feeders = []
         max_pending_groups = self.cfg.pipeline.get('prompt_max_pending_groups')
         for context_cfg, context in zip(training_context_configs(self.cfg), self.contexts):
             dataset_cfg = context_dataset_config(self.cfg, context_cfg)
+            dataset_factory = partial(
+                build_prompt_dataset_from_config,
+                OmegaConf.to_container(context_cfg, resolve=True),
+                OmegaConf.to_container(self.cfg.model.template, resolve=True),
+            )
             dataloader = DataLoader(
-                dataset=lambda context_cfg=context_cfg: self.build_dataset(context_cfg),
+                dataset=dataset_factory,
                 batch_size=int(dataset_cfg.batch_size),
                 min_batch_size=int(dataset_cfg.batch_size),
                 device_mesh=self.model_mesh,
@@ -312,30 +366,12 @@ class AsyncMultiLoraGRPOPipeline(BaseRLPipeline):
         return feeders
 
     def build_dataset(self, context_cfg):
-        from twinkle.dataset import Dataset, DatasetMeta
-        from twinkle.preprocessor.llm import GSM8KProcessor
+        from omegaconf import OmegaConf
 
-        dataset_cfg = context_dataset_config(self.cfg, context_cfg)
-        data_slice = range(int(dataset_cfg.data_num)) if dataset_cfg.get('data_num') else None
-        dataset = Dataset()
-        dataset.add_dataset(
-            DatasetMeta(
-                dataset_cfg.dataset_id,
-                subset_name=dataset_cfg.get('subset_name'),
-                split=dataset_cfg.get('split', 'train'),
-                data_slice=data_slice,
-            ))
-        template_cfg = self.cfg.model.template
-        dataset.set_template(
-            template_cfg.cls,
-            model_id=context_cfg.base_model_id,
-            max_length=template_cfg.get('max_length', 4096),
-            truncation_strategy=template_cfg.get('truncation_strategy', 'delete'),
-            enable_thinking=template_cfg.get('enable_thinking', False),
+        return build_prompt_dataset_from_config(
+            OmegaConf.to_container(context_cfg, resolve=True),
+            OmegaConf.to_container(self.cfg.model.template, resolve=True),
         )
-        dataset.map(GSM8KProcessor(system=dataset_cfg.system_prompt))
-        dataset.encode(add_generation_prompt=True)
-        return dataset
 
     def build_reward_registry(self):
         registry = {}
