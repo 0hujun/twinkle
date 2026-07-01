@@ -544,7 +544,7 @@ class TestDesignDocConsistency:
         partition = dp.create_partition(ctx, target_groups=1)
         dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0)], seal=True)
 
-        with pytest.raises(ValueError, match='belongs to'):
+        with pytest.raises(ValueError, match='metadata mismatch'):
             dp.append_rewards(other, partition.partition_id, [1.0])
 
     def test_append_advantages_rejects_cross_context(self):
@@ -556,7 +556,7 @@ class TestDesignDocConsistency:
         dp.put_rollout_batch(ctx, partition.partition_id, [make_sample(0)], seal=True)
         dp.append_rewards(ctx, partition.partition_id, [1.0])
 
-        with pytest.raises(ValueError, match='belongs to'):
+        with pytest.raises(ValueError, match='metadata mismatch'):
             dp.append_advantages(other, partition.partition_id, [0.5])
 
     def test_cross_context_data_isolation(self):
@@ -574,7 +574,7 @@ class TestDesignDocConsistency:
         dp.put_rollout_batch(ctx_b, partition_b.partition_id, [make_sample(1)], seal=True)
 
         # Try to append rewards using wrong context
-        with pytest.raises(ValueError, match='belongs to'):
+        with pytest.raises(ValueError, match='metadata mismatch'):
             dp.append_rewards(ctx_b, partition_a.partition_id, [2.0])
 
         # Verify correct context can still append
@@ -586,7 +586,7 @@ class TestDesignDocConsistency:
         assert samples_a[0]['rewards'] == 1.0
 
         # Try to append advantages using wrong context
-        with pytest.raises(ValueError, match='belongs to'):
+        with pytest.raises(ValueError, match='metadata mismatch'):
             dp.append_advantages(ctx_b, partition_a.partition_id, [0.5])
 
         # Verify correct context can still append

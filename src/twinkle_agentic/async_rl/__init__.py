@@ -6,11 +6,11 @@ from .grpo_pipeline import AsyncMultiLoraGRPOPipeline
 from .pipeline import BaseRLPipeline, BaseRLPipelineConfig
 from .prompt_feeder import PromptFeeder
 from .registry import AdapterRegistry
+from .rollout_scheduling import DeficitFairRolloutPolicy, WorkConservingRolloutPolicy
 from .scheduler import RejectedPartition, ScheduleDecision, TrainerScheduler, TrainerSchedulerConfig
-from .scheduling import (
+from .train_scheduling import (
     AdaptiveTrainPolicy,
     CostAwareTrainPolicy,
-    DeficitFairRolloutPolicy,
     DeficitFairTrainPolicy,
     EDFTrainPolicy,
     FIFOTrainPolicy,
@@ -20,7 +20,6 @@ from .scheduling import (
     SJFTrainPolicy,
     StrideTrainPolicy,
     WeightedFairQueueTrainPolicy,
-    WorkConservingRolloutPolicy,
 )
 from .staleness import StalenessManager
 from .types import (
@@ -29,7 +28,6 @@ from .types import (
     ComponentResult,
     PartitionMetadata,
     PartitionStatus,
-    QueueMetadata,
     RolloutCapacity,
     RolloutContextState,
     TaskName,
@@ -62,7 +60,6 @@ __all__ = [
     'PreferCurrentTrainPolicy',
     'PriorityTrainPolicy',
     'PromptFeeder',
-    'QueueMetadata',
     'RejectedPartition',
     'RewardWorker',
     'RolloutCapacity',

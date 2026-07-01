@@ -12,7 +12,7 @@ from twinkle_agentic.tools.tool_manager import ToolManager
 from .data_plane import TransferQueueDataPlane
 from .registry import AdapterRegistry
 from .scheduler import TrainerScheduler
-from .scheduling import WorkConservingRolloutPolicy
+from .rollout_scheduling import WorkConservingRolloutPolicy
 from .staleness import StalenessManager
 from .types import (ComponentResult, PartitionMetadata, PartitionStatus, RolloutCallable, RolloutContextState,
                     SampleRecord, TrainingContext)

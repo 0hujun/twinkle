@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from .data_plane import TransferQueueDataPlane
 from .registry import AdapterRegistry
-from .scheduling import (
+from .train_scheduling import (
     AdaptiveTrainPolicy,
     CostAwareTrainPolicy,
     DeficitFairTrainPolicy,
@@ -102,13 +102,27 @@ class TrainerScheduler:
         data_plane: Optional[TransferQueueDataPlane] = None,
         train_policy: Optional[Any] = None,
         config: Optional[TrainerSchedulerConfig] = None,
+        supported_reward_type: Optional[str] = None,
+        supported_loss_type: Optional[str] = None,
+        supported_algorithm: Optional[str] = None,
     ):
         self.adapter_registry = adapter_registry
         self.data_plane = data_plane
         self.config = config or TrainerSchedulerConfig()
         self.train_policy = train_policy or self.config.build_policy(adapter_registry)
+        self.supported_reward_type = supported_reward_type
+        self.supported_loss_type = supported_loss_type
+        self.supported_algorithm = supported_algorithm
 
     def is_compatible(self, partition: PartitionMetadata) -> bool:
+        """Check if partition's reward_type/loss_type/algorithm matches trainer config."""
+        ctx = partition.context
+        if self.supported_reward_type is not None and ctx.reward_type != self.supported_reward_type:
+            return False
+        if self.supported_loss_type is not None and ctx.loss_type != self.supported_loss_type:
+            return False
+        if self.supported_algorithm is not None and ctx.algorithm != self.supported_algorithm:
+            return False
         return True
 
     def list_train_ready_partitions(self) -> list[PartitionMetadata]:
