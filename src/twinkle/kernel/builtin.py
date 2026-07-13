@@ -86,8 +86,14 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
 
     # === FLA (side-effect; mapping-incompatible) ===
     if is_npu_platform:
-        apply_qwen3_5_fla(model)
-
+        from twinkle.utils.import_utils import exists
+        if exists('mindspeed'):
+            apply_qwen3_5_fla(model)
+        else:
+            logger.warning('[NPU] [FLA] mindspeed is not installed; '
+                           'FLA patch for Qwen3.5 requires mindspeed. '
+                           'Install it with: pip install mindspeed. '
+                           'Other NPU patches will still apply.')
     return bundle
 
 
