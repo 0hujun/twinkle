@@ -407,7 +407,7 @@ def npu_dsv4_csa_compressor_forward(
         n_windows = chunk_kv.shape[1] // self.compress_rate
         ratio = self.compress_rate
         chunk_kv = chunk_kv.view(batch, n_windows, ratio, -1)
-        chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias
+        chunk_gate = chunk_gate.view(batch, n_windows, ratio, -1) + self.position_bias.to(chunk_gate.dtype)
 
         new_kv = chunk_kv.new_zeros((batch, n_windows, 2 * ratio, self.head_dim))
         new_gate = chunk_gate.new_full((batch, n_windows, 2 * ratio, self.head_dim), float('-inf'))
