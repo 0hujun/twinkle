@@ -263,4 +263,3 @@ def _add_deepseek_v4_entries(bundle, attention_fn, indexer_fn, csa_compressor_fn
     _add_attr_if_present(bundle, base, 'DeepseekV4Indexer.forward', indexer_fn)
     _add_attr_if_present(bundle, base, 'DeepseekV4CSACompressor.forward', csa_compressor_fn)
     logger.info('[NPU] [DSV4] SAS + LI patch registered (CSA uses Lightning Indexer top-k)')
-
